@@ -41,25 +41,45 @@ mkdir -p "$sdk/downloads" "$sdk/toolchain"
 if (( $# >= 4 )); then
   bsp=$3; sample=$4
   [[ -f $bsp && -f $sample ]] || die 'Both local archives must exist'
-elif (( $# == 1 || $# == 2 )) && [[ $release = 36.4.4 ]]; then
-  bsp="$sdk/downloads/Jetson_Linux_R36.4.4_aarch64.tbz2"
-  sample="$sdk/downloads/Tegra_Linux_Sample-Root-Filesystem_r36.4.4_aarch64.tbz2"
-  log 'Downloading official Jetson Linux 36.4.4 BSP and sample rootfs'
+elif (( $# == 1 || $# == 2 )); then
+  case "$release" in
+    36.4.0)
+      bsp="$sdk/downloads/Jetson_Linux_R36.4.0_aarch64.tbz2"
+      sample="$sdk/downloads/Tegra_Linux_Sample-Root-Filesystem_r36.4.0_aarch64.tbz2"
+      download_base='https://developer.nvidia.com/downloads/embedded/l4t/r36_release_v4.0/release'
+      ;;
+    36.4.4)
+      bsp="$sdk/downloads/Jetson_Linux_R36.4.4_aarch64.tbz2"
+      sample="$sdk/downloads/Tegra_Linux_Sample-Root-Filesystem_r36.4.4_aarch64.tbz2"
+      download_base='https://developer.nvidia.com/downloads/embedded/l4t/r36_release_v4.4/release'
+      ;;
+    *)
+      die "For L4T $release, pass matching official BSP and Sample Root Filesystem archives as arguments 4 and 5"
+      ;;
+  esac
+  log "Downloading official Jetson Linux $release BSP and sample rootfs"
   [[ -s $bsp ]] || curl -fL --retry 3 -o "$bsp" \
-    'https://developer.nvidia.com/downloads/embedded/l4t/r36_release_v4.4/release/Jetson_Linux_r36.4.4_aarch64.tbz2'
+    "$download_base/Jetson_Linux_r${release}_aarch64.tbz2"
   [[ -s $sample ]] || curl -fL --retry 3 -o "$sample" \
-    'https://developer.nvidia.com/downloads/embedded/l4t/r36_release_v4.4/release/Tegra_Linux_Sample-Root-Filesystem_r36.4.4_aarch64.tbz2'
+    "$download_base/Tegra_Linux_Sample-Root-Filesystem_r${release}_aarch64.tbz2"
 else
   die "For L4T $release, pass matching official BSP and Sample Root Filesystem archives as arguments 4 and 5"
 fi
 
 log 'Preparing NVIDIA sample filesystem'
 if [[ ! -f $sdk/.rootfs-initialized ]]; then
-  tar -xjf "$bsp" -C "$sdk"
   l4t="$sdk/Linux_for_Tegra"
+  if [[ -d $l4t ]]; then
+    log 'Removing incomplete NVIDIA rootfs setup before retrying'
+    sudo rm -rf "$l4t"
+  fi
+  tar -xjf "$bsp" -C "$sdk"
   [[ -x $l4t/apply_binaries.sh ]] || die 'BSP archive did not contain Linux_for_Tegra/apply_binaries.sh'
   sudo tar -xjpf "$sample" -C "$l4t/rootfs"
+  [[ -x /usr/bin/qemu-aarch64-static ]] || die 'qemu-aarch64-static missing after host tool installation'
+  sudo install -m 0755 /usr/bin/qemu-aarch64-static "$sdk/qemu-aarch64-static"
   (cd "$l4t" && sudo ./apply_binaries.sh)
+  sudo rm -f "$sdk/qemu-aarch64-static"
   touch "$sdk/.rootfs-initialized"
 fi
 root="$sdk/Linux_for_Tegra/rootfs"
@@ -174,8 +194,11 @@ set(CMAKE_SYSTEM_PROCESSOR aarch64)
 set(CMAKE_SYSROOT "\$ENV{JETSON_SDK}/Linux_for_Tegra/rootfs")
 set(CMAKE_C_COMPILER "\$ENV{JETSON_CROSS}gcc")
 set(CMAKE_CXX_COMPILER "\$ENV{JETSON_CROSS}g++")
+set(CMAKE_AR "\$ENV{JETSON_CROSS}ar")
+set(CMAKE_RANLIB "\$ENV{JETSON_CROSS}ranlib")
 set(CMAKE_CUDA_COMPILER "\$ENV{CUDACXX}")
 set(CMAKE_CUDA_HOST_COMPILER "\$ENV{CUDAHOSTCXX}")
+set(CMAKE_CUDA_ARCHIVE_FINISH "<CMAKE_RANLIB> <TARGET>")
 set(CMAKE_FIND_ROOT_PATH "\${CMAKE_SYSROOT}")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)

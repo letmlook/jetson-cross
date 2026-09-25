@@ -12,6 +12,17 @@ grep -Fq 'sudo() { command env "$@"; }' "$script"
 grep -Fq 'update-binfmts --enable qemu-aarch64' "$script"
 grep -Fq '/proc/sys/fs/binfmt_misc/qemu-aarch64' "$script"
 
+# JetPack 6.1's apply_binaries.sh installs ARM64 BSP packages under QEMU, so
+# make its preferred adjacent static binary available before invoking it.
+qemu_prepare_line=$(grep -n 'qemu-aarch64-static "$sdk/qemu-aarch64-static"' "$script" | cut -d: -f1)
+apply_line=$(grep -n 'sudo ./apply_binaries.sh' "$script" | cut -d: -f1)
+[[ -n $qemu_prepare_line && -n $apply_line && $qemu_prepare_line -lt $apply_line ]]
+
+# A failed rootfs setup must be restartable without redownloading the BSP and
+# Sample RootFS archives. Only the incomplete extracted BSP tree is removed.
+grep -Fq 'Removing incomplete NVIDIA rootfs setup before retrying' "$script"
+grep -Fq 'sudo rm -rf "$l4t"' "$script"
+
 # apply_binaries.sh installs an unsigned-by NVIDIA source for the same URLs.
 # Keeping it active alongside jetson-cross-sdk.list makes apt reject both.
 grep -Fq '"$bsp_source.disabled"' "$script"
