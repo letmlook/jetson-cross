@@ -188,6 +188,7 @@ export PKG_CONFIG_SYSROOT_DIR='$activate_root'
 export PKG_CONFIG_LIBDIR='$activate_root/usr/lib/aarch64-linux-gnu/pkgconfig:$activate_root/usr/lib/pkgconfig:$activate_root/usr/share/pkgconfig:$activate_root/usr/local/lib/aarch64-linux-gnu/pkgconfig'
 unset PKG_CONFIG_PATH
 EOF
+chmod 0755 "$sdk/activate.sh"
 cat > "$sdk/toolchain.cmake" <<EOF
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)

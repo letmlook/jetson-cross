@@ -59,6 +59,10 @@ grep -Fq 'if [[ -z $nvcc ]]; then' "$script"
 grep -Fq 'JETSON_SDK_ACTIVATE_PATH' "$script"
 grep -Fq 'JETSON_NVCC_ACTIVATE_PATH' "$script"
 
+# The generated activation helper must be directly executable as well as
+# sourceable by an interactive shell.
+grep -Fq 'chmod 0755 "$sdk/activate.sh"' "$script"
+
 # Installation may run in a container whose Ninja binary is not persisted to
 # the host, so the printed host-side example must not force that generator.
 ! grep -Fq 'cmake -S PROJECT -B BUILD -G Ninja' "$script"
