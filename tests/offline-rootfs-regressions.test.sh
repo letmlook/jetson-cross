@@ -52,7 +52,7 @@ grep -Fq -- '-B"$root/usr/lib/aarch64-linux-gnu/"' "$script"
 # /usr/local, the update-alternatives symlink can be broken on the host, so
 # the versioned directory is the reliable fallback.
 grep -Fq 'cuda-$cuda_version/bin/nvcc' "$script"
-grep -Fq 'if [[ -z $nvcc ]]; then' "$script"
+grep -Fq 'if [[ -z $nvcc ]] && ! $native_arm64; then' "$script"
 
 # A container run writes paths consumed later on the host. Allow those paths
 # to be supplied separately from the paths used while the script is running.

@@ -1,18 +1,37 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Usage: ./setup-jetson-cross-sdk.sh user@jetson L4T_VERSION CUDA_VERSION [SDK_DIRECTORY]
+# Usage: ./setup-jetson-cross-sdk.sh user@jetson [JETPACK_OR_L4T_VERSION] CUDA_VERSION [SDK_DIRECTORY]
 # Supported: L4T R35/R36, x86_64 Ubuntu 20.04/22.04. No target package changes.
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=lib/jetson-versions.sh
+source "$script_dir/lib/jetson-versions.sh"
+
 TARGET=${1:-}
-REQUEST_L4T=${2:-}
-cuda_version=${3:-}
-SDK=${4:-"$HOME/jetson-cross-sdk-r${REQUEST_L4T}-cuda-${cuda_version}"}
-[[ -n $TARGET && $TARGET != -* && $# -ge 3 && $# -le 4 ]] || {
-  echo "Usage: $0 user@jetson 36.4 12.2 [sdk-directory]" >&2; exit 2;
+if (( $# == 2 )); then
+  version_input=$DEFAULT_JETPACK_VERSION
+  cuda_version=$2
+  sdk_arg=
+elif (( $# == 3 || $# == 4 )); then
+  version_input=$2
+  cuda_version=$3
+  sdk_arg=${4:-}
+else
+  version_input=
+  cuda_version=
+  sdk_arg=
+fi
+[[ -n $TARGET && $TARGET != -* ]] || {
+  echo "Usage: $0 user@jetson [6.1|36.4.0] CUDA_VERSION [sdk-directory]" >&2; exit 2;
 }
-[[ $REQUEST_L4T =~ ^(35|36)\.[0-9]+$ && $cuda_version =~ ^[0-9]+\.[0-9]+$ ]] || {
-  echo 'Expected L4T major.minor (35.x or 36.x) and CUDA major.minor, e.g. 36.4 12.2' >&2; exit 2;
+resolve_jetson_version "$version_input" || {
+  echo "Usage: $0 user@jetson [6.1|36.4.0] CUDA_VERSION [sdk-directory]" >&2; exit 2;
 }
+[[ $cuda_version =~ ^[0-9]+\.[0-9]+$ ]] || {
+  echo 'Expected CUDA major.minor, e.g. 12.6' >&2; exit 2;
+}
+REQUEST_L4T=$L4T_VERSION
+SDK=${sdk_arg:-"$HOME/jetson-cross-sdk-${JETSON_VERSION_SLUG}-cuda-${cuda_version}"}
 [[ $SDK = /* ]] || SDK="$PWD/$SDK"
 [[ $(uname -m) = x86_64 ]] || { echo 'x86_64 host required' >&2; exit 1; }
 . /etc/os-release
@@ -28,8 +47,9 @@ trap 'echo "Failed at line $LINENO. SDK path: $SDK" >&2' ERR
 log 'Checking requested versions against target (read-only)'
 remote=$(ssh -o BatchMode=yes "$TARGET" 'set -e; test "$(uname -m)" = aarch64; dpkg-query -W -f="${Version}" nvidia-l4t-core; echo; if test -f /usr/local/cuda/version.json; then sed -n "s/.*\"version\"[[:space:]]*:[[:space:]]*\"\([0-9]*\.[0-9]*\).*$/\1/p" /usr/local/cuda/version.json | head -1; fi; readlink -f /usr/local/cuda || true; dpkg-query -W -f="${Package} ${Version}\n" libnvinfer-dev libopencv-dev libgstreamer1.0-dev libavformat-dev 2>/dev/null || true')
 l4t=$(printf '%s\n' "$remote" | sed -n '1p')
-major=${l4t%%.*}; minor=$(printf '%s' "$l4t" | cut -d. -f2)
-[[ $major.$minor = "$REQUEST_L4T" ]] || die "Requested L4T $REQUEST_L4T but target has $l4t"
+major=${REQUEST_L4T%%.*}; minor=$(printf '%s' "$REQUEST_L4T" | cut -d. -f2)
+target_l4t=$(printf '%s' "$l4t" | sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+[[ $target_l4t = "$REQUEST_L4T" ]] || die "Requested L4T $REQUEST_L4T but target has $l4t"
 cuda_path=$(printf '%s\n' "$remote" | grep -m1 '^/usr/local/cuda-' || true)
 target_cuda=$(printf '%s\n' "$cuda_path" | sed -n 's@^/usr/local/cuda-\([0-9]*\.[0-9]*\).*@\1@p')
 [[ -n $target_cuda ]] || target_cuda=$(printf '%s\n' "$remote" | sed -n '2p' | grep -E '^[0-9]+\.[0-9]+$' || true)
@@ -38,6 +58,7 @@ cuda_pkg=${cuda_version/./-}
 if [[ $major = 35 ]]; then toolchain_release=2020.08-1; else toolchain_release=2022.08-1; fi
 toolchain_name="aarch64--glibc--stable-${toolchain_release}"
 repo="r${major}.${minor}"
+if [[ -n $JETPACK_VERSION ]]; then log "Resolved JetPack $JETPACK_VERSION to L4T $REQUEST_L4T"; fi
 log "Target L4T=$l4t CUDA=$cuda_version; host repo=$repo"
 printf '%s\n' "$remote" | tail -n +4
 
