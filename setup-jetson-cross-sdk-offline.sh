@@ -261,19 +261,39 @@ cuda_suffix=$(rootfs_exec /bin/sh -c \
   "apt-cache depends cuda-toolkit | sed -n 's/.*Depends: cuda-toolkit-\([0-9][0-9]*-[0-9][0-9]*\)$/\1/p' | head -n 1")
 [[ $cuda_suffix =~ ^[0-9]+-[0-9]+$ ]] \
   || die 'Could not resolve the default versioned CUDA development package'
-# Install JetPack 6.1 development stack:
-# - cuda-toolkit-12-6 + cuda-nvcc-12-6 + cuda-libraries-dev-12-6 cover CUDA
-# - libnvinfer-dev + libnvinfer-bin cover TensorRT 10.3
-# - libcudnn9-cuda-12 + libcudnn9-dev-cuda-12 + libcudnn9-samples cover cuDNN 9
-#   (no NVIDIA meta package ships for the JetPack 6.1 repo)
-# - nvidia-vpi-dev covers NVIDIA Vision Programming Interface
-# Skip the broken NVIDIA libopencv-dev 4.8.0 (its libopencv-*.so.408 symlinks
-# point at runtime libraries the Jetson repo never published); keep the Ubuntu
-# 4.5 ABI which has matching dev + runtime packages.
-rootfs_packages="cuda-toolkit-12-6 cuda-libraries-dev-12-6 libnvinfer-dev libnvinfer-bin libcudnn9-cuda-12 libcudnn9-dev-cuda-12 libcudnn9-samples nvidia-vpi-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev"
-if $native_arm64; then rootfs_packages="cuda-nvcc-$cuda_suffix $rootfs_packages"; fi
+# Install the JetPack development stack from NVIDIA's own nvidia-* bundle.
+# nvidia-jetpack-dev aggregates VPI, CUDA, TensorRT, cuDNN and OpenCV. Each
+# Jetson release ships its own build of the bundle and of every nvidia-* package
+# it depends on, so apt resolves the matching set on its own.
+if rootfs_exec /bin/sh -c \
+  "apt-cache show nvidia-jetpack-dev >/dev/null 2>&1"; then
+  log 'Installing NVIDIA JetPack development bundle (nvidia-jetpack-dev)'
+  rootfs_exec /bin/sh -c \
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nvidia-jetpack-dev"
+  # nvidia-jetpack-dev pulls nvidia-opencv-dev, which pins the Jetson repo's
+  # libopencv-dev 4.8.0. That build is broken on JetPack 6.1: its
+  # libopencv-*.so.408 links point at runtime libraries the repo never
+  # published. Drop the NVIDIA OpenCV bundle before installing the working
+  # Ubuntu 4.5 ABI below, otherwise the two versions cannot coexist.
+  rootfs_exec /bin/sh -c \
+    "DEBIAN_FRONTEND=noninteractive apt-get remove -y --no-install-recommends nvidia-opencv-dev nvidia-opencv libopencv-dev libopencv-python libopencv-samples opencv-licenses opencv-samples-data" \
+    || log 'WARNING: could not remove the NVIDIA OpenCV bundle; the OpenCV step below may fail'
+else
+  log "WARNING: nvidia-jetpack-dev is unavailable for this release"
+  log '         Falling back to the explicit component list'
+  rootfs_packages="cuda-toolkit-12-6 cuda-libraries-dev-12-6 libnvinfer-dev libnvinfer-bin libcudnn9-cuda-12 libcudnn9-dev-cuda-12 libcudnn9-samples nvidia-vpi-dev"
+  if $native_arm64; then rootfs_packages="cuda-nvcc-$cuda_suffix $rootfs_packages"; fi
+  rootfs_exec /bin/sh -c \
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $rootfs_packages"
+fi
+# GStreamer and FFmpeg development headers are not part of the nvidia-* bundle.
 rootfs_exec /bin/sh -c \
-  "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $rootfs_packages"
+  "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev"
+if $native_arm64; then
+  rootfs_exec /bin/sh -c \
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cuda-nvcc-$cuda_suffix" \
+    || log "WARNING: cuda-nvcc-$cuda_suffix could not be installed in the rootfs"
+fi
 # The compiler-internal CUDA headers live in a separate package: cuda_runtime.h
 # includes "crt/host_config.h", and cuda-cudart-dev only ships the thin
 # wrappers in include/. Without cuda-crt no CUDA translation unit compiles.
@@ -283,7 +303,7 @@ rootfs_exec /bin/sh -c \
   "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cuda-crt-$cuda_suffix" \
   || log "WARNING: cuda-crt-$cuda_suffix could not be installed; the sysroot CUDA headers will be incomplete"
 rootfs_exec /bin/sh -c \
-  "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libopencv-core4.5d libopencv-imgproc4.5d libopencv-dnn4.5d libopencv-dev=4.5.4+dfsg-9ubuntu4"
+  "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-downgrades libopencv-core4.5d libopencv-imgproc4.5d libopencv-dnn4.5d libopencv-dev=4.5.4+dfsg-9ubuntu4"
 cleanup
 trap - EXIT
 mounted=()
@@ -403,7 +423,7 @@ for candidate in usr/include usr/include/aarch64-linux-gnu usr/include/x86_64-li
   fi
 done
 [[ -n $cudnn_include_dir ]] \
-  || die 'cudnn.h missing after ARM64 apt install; libcudnn9-dev-cuda-12 did not provide it'
+  || die 'cudnn.h missing after ARM64 apt install; the cuDNN dev package did not provide it'
 cudnn_lib_dir=
 for candidate in usr/lib/aarch64-linux-gnu usr/lib usr/lib/x86_64-linux-gnu; do
   if [[ -f $root/$candidate/libcudnn.so ]]; then
@@ -412,7 +432,7 @@ for candidate in usr/lib/aarch64-linux-gnu usr/lib usr/lib/x86_64-linux-gnu; do
   fi
 done
 [[ -n $cudnn_lib_dir ]] \
-  || die 'libcudnn.so missing after ARM64 apt install; libcudnn9-cuda-12 did not provide it'
+  || die 'libcudnn.so missing after ARM64 apt install; the cuDNN runtime package did not provide it'
 log "cuDNN headers in /$cudnn_include_dir, libraries in /$cudnn_lib_dir"
 # CMAKE_SYSROOT already adds <sysroot>/usr/include, so only a non-default
 # directory needs to be passed explicitly.

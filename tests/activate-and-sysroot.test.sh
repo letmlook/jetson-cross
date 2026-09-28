@@ -94,6 +94,20 @@ grep -Fq 'smoke-cudnn-aarch64' "$offline"
 grep -Fq '#include <cudnn.h>' "$offline"
 grep -Fq 'did not link against the sysroot libcudnn' "$offline"
 
+# ------------------------------------------------------- nvidia-* JetPack bundle
+# The Jetson repository ships its own build of nvidia-jetpack-dev and of every
+# nvidia-* package it depends on, so apt must resolve the set without a manual
+# version pin, and the explicit component list stays as a fallback.
+grep -Fq 'apt-cache show nvidia-jetpack-dev' "$offline"
+grep -Fq 'apt-get install -y --no-install-recommends nvidia-jetpack-dev"' "$offline"
+grep -Fq 'Falling back to the explicit component list' "$offline"
+! grep -Fq 'nvidia-jetpack-dev=$' "$offline"
+# nvidia-jetpack-dev pins the broken NVIDIA libopencv-dev 4.8.0, so the bundle
+# must be dropped before the working Ubuntu 4.5 ABI is installed.
+grep -Fq 'apt-get remove -y --no-install-recommends nvidia-opencv-dev nvidia-opencv' "$offline"
+grep -Fq -- '--allow-downgrades' "$offline"
+grep -Fq 'libopencv-dev=4.5.4+dfsg-9ubuntu4' "$offline"
+
 # ----------------------------------------------------------------- toolchain.cmake
 # The offline script must still write an executable activation file.
 grep -Fq 'chmod 0755 "$sdk/activate.sh"' "$offline"
