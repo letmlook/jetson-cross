@@ -3,6 +3,12 @@
 The setup scripts accept either a JetPack version or its L4T version. The
 default is JetPack 6.1 (L4T 36.4.0).
 
+## Documentation
+
+- **[使用说明.md](docs/使用说明.md)** — how to use the generated SDK: activation,
+  exported variables, CMake/Make/g++ invocations, CUDA, sysroot symlink
+  behaviour, deployment to a Jetson, and troubleshooting.
+
 ## Apple Silicon
 
 Docker Desktop is required. Initialization runs in a native `linux/arm64`
