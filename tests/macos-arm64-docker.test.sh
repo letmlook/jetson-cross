@@ -2,12 +2,15 @@
 set -euo pipefail
 
 # Regression contract: the macOS wrapper must keep the mutable SDK in a
-# versioned volume, and must be able to copy that volume into an immutable
-# image without granting privileges to normal build containers.
+# versioned volume, and must package that volume as a tar.gz archive without
+# granting privileges to normal build or archive containers.
 repo=$(cd "$(dirname "$0")/.." && pwd)
 script="$repo/setup-jetson-cross-sdk-macos-arm64.sh"
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# The fake bin directory shadows `uname`, which cleanup tooling also uses to
+# detect the platform. Restore the real PATH before removing the temp tree.
+real_path=$PATH
+trap 'PATH=$real_path; export PATH; rm -rf "$tmp"' EXIT
 fakebin="$tmp/bin"
 mkdir -p "$fakebin"
 
@@ -30,19 +33,31 @@ if test "${1:-}" = info; then
     *'.NoProxy'*) printf '%s\n' "${FAKE_DOCKER_NO_PROXY:-}" ;;
   esac
 fi
-if test "${1:-} ${2:-}" = 'create --platform'; then
-  printf '%s\n' jetson-snapshot-test
-fi
+# When the wrapper asks to create an archive, write it to the host directory
+# that was bind-mounted at /out so the follow-up assertions run on a real file.
+case "$*" in
+  *'tar czf'*) name=''; dest=''
+    for arg in "$@"; do
+      case "$arg" in
+        ARCHIVE_NAME=*) name=${arg#ARCHIVE_NAME=} ;;
+        *:/out) dest=${arg%:/out} ;;
+      esac
+    done
+    if test -n "$name" && test -n "$dest"; then
+      mkdir -p "$dest"
+      : > "$dest/$name"
+    fi ;;
+esac
 EOF
 chmod +x "$fakebin/uname" "$fakebin/docker"
 
 export DOCKER_LOG="$tmp/docker.log"
+export FAKE_ARCHIVE_DIR="$tmp"
 export FAKE_DOCKER_HTTP_PROXY=http.docker.internal:3128
 export FAKE_DOCKER_HTTPS_PROXY=http://localhost:7892
 export PATH="$fakebin:$PATH"
 volume=jetson-cross-sdk-jp6.2.1-l4t36.4.4-arm64
 base=jetson-cross-sdk-base:macos-arm64-ubuntu22.04
-snapshot=jetson-cross-sdk:jp6.2.1-l4t36.4.4-arm64
 
 # Omitting a version selects JetPack 6.1.
 : > "$DOCKER_LOG"
@@ -71,21 +86,53 @@ bash "$script" init 36.4.4
 grep -Fq -- "volume inspect $volume" "$DOCKER_LOG"
 grep -Fq -- "-v $volume:/opt/jetson-sdk" "$DOCKER_LOG"
 
+# Archiving writes a tar.gz of the volume and must not build a Docker image.
+# An explicit output path keeps the archive inside the temp directory.
 : > "$DOCKER_LOG"
-bash "$script" image 6.2.1
+bash "$script" archive 6.2.1 "$tmp/jp6.2.1.tar.gz"
 grep -Fq -- "-v $volume:/source-sdk:ro" "$DOCKER_LOG"
 grep -Fq -- "test -f /source-sdk/.setup-complete" "$DOCKER_LOG"
-grep -Fq -- "exec jetson-snapshot-test" "$DOCKER_LOG"
-grep -Fq -- "commit" "$DOCKER_LOG"
-grep -Fq -- "$snapshot" "$DOCKER_LOG"
+grep -Fq -- "ARCHIVE_NAME=jp6.2.1.tar.gz" "$DOCKER_LOG"
+grep -Fq -- 'tar czf "/out/$ARCHIVE_NAME" -C /source-sdk .' "$DOCKER_LOG"
+[[ -f $tmp/jp6.2.1.tar.gz ]] || { echo 'FAIL: archive not written' >&2; exit 1; }
+! grep -Fq -- 'commit' "$DOCKER_LOG"
+! grep -Fq -- 'docker create' "$DOCKER_LOG"
+! grep -Fq -- '--privileged' "$DOCKER_LOG"
+
+# A relative output path is resolved against the current directory.
+mkdir -p "$tmp/backup"
+: > "$DOCKER_LOG"
+(cd "$tmp" && bash "$script" archive 6.2.1 backup/custom.tar.gz)
+grep -Fq -- "ARCHIVE_NAME=custom.tar.gz" "$DOCKER_LOG"
+grep -Fq -- "$tmp/backup:/out" "$DOCKER_LOG"
+[[ -f $tmp/backup/custom.tar.gz ]] || { echo 'FAIL: relative archive not written' >&2; exit 1; }
+
+# The default output name carries the resolved version slug.
+: > "$DOCKER_LOG"
+(cd "$tmp" && bash "$script" archive 6.2.1)
+grep -Fq -- "ARCHIVE_NAME=jetson-cross-sdk-jp6.2.1-l4t36.4.4-arm64.tar.gz" "$DOCKER_LOG"
+[[ -f $tmp/jetson-cross-sdk-jp6.2.1-l4t36.4.4-arm64.tar.gz ]] \
+  || { echo 'FAIL: default archive name not written' >&2; exit 1; }
+
+# Restoring reads a tar.gz back into the volume, again without privileges.
+: > "$DOCKER_LOG"
+printf 'payload' > "$tmp/restore-me.tar.gz"
+bash "$script" restore 6.2.1 "$tmp/restore-me.tar.gz"
+grep -Fq -- "-v $volume:/target" "$DOCKER_LOG"
+grep -Fq -- 'tar xzf "/archive/$ARCHIVE_NAME" -C /target' "$DOCKER_LOG"
+grep -Fq -- "$tmp:/archive:ro" "$DOCKER_LOG"
+! grep -Fq -- '--privileged' "$DOCKER_LOG"
+
+# A missing archive must fail loudly instead of silently doing nothing.
+! bash "$script" restore 6.2.1 "$tmp/absent.tar.gz" 2>/dev/null
+
+# The Docker image workflow is gone: no --image flag, no image subcommand.
+! bash "$script" image 6.2.1 2>/dev/null
+! bash "$script" run --image 6.2.1 true 2>/dev/null
 
 : > "$DOCKER_LOG"
 bash "$script" run 6.2.1 true
 grep -Fq -- "-v $volume:/opt/jetson-sdk" "$DOCKER_LOG"
 ! grep -Fq -- '--privileged' "$DOCKER_LOG"
 
-: > "$DOCKER_LOG"
-bash "$script" run --image 36.4.4 true
-grep -Fq -- "$snapshot true" "$DOCKER_LOG"
-! grep -Fq -- "$volume:/opt/jetson-sdk" "$DOCKER_LOG"
-! grep -Fq -- '--privileged' "$DOCKER_LOG"
+echo "macos-arm64 archive tests passed"

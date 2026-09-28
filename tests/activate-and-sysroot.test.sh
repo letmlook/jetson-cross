@@ -80,9 +80,10 @@ done
 
 # ----------------------------------------------------------------------- cuDNN
 # An earlier package list silently omitted cuDNN and nothing detected it, so
-# the SDK reported success while no cuDNN code could be built.
-grep -Fq 'libcudnn9-dev-cuda-12' "$offline"
-grep -Fq 'libcudnn9-cuda-12' "$offline"
+# the SDK reported success while no cuDNN code could be built. The fallback
+# list derives the versioned names rather than pinning them to 12-6.
+grep -Fq 'libcudnn9-dev-cuda-$cuda_major' "$offline"
+grep -Fq 'libcudnn9-cuda-$cuda_major' "$offline"
 # Presence on disk is not enough: the headers land in a non-obvious directory,
 # so they must be located and the directory added to the toolchain.
 grep -Fq 'cudnn.h missing after ARM64 apt install' "$offline"

@@ -34,19 +34,22 @@ Open a build shell or run one command using the mutable volume:
 ./setup-jetson-cross-sdk-macos-arm64.sh run cmake --build /workspace/build
 ```
 
-Freeze a successfully initialized volume into a reusable image, then build
-from that image:
+Package a successfully initialized volume into a `tar.gz` archive you can move
+between machines, then restore it:
 
 ```bash
-./setup-jetson-cross-sdk-macos-arm64.sh image 6.2.1
-./setup-jetson-cross-sdk-macos-arm64.sh shell --image 6.2.1
-./setup-jetson-cross-sdk-macos-arm64.sh run --image 6.2.1 cmake --build /workspace/build
+./setup-jetson-cross-sdk-macos-arm64.sh archive 6.2.1
+./setup-jetson-cross-sdk-macos-arm64.sh archive 6.2.1 /path/to/sdk.tar.gz
+
+./setup-jetson-cross-sdk-macos-arm64.sh restore 6.2.1 /path/to/sdk.tar.gz
 ```
 
-The frozen image is tagged
-`jetson-cross-sdk:jp6.2.1-l4t36.4.4-arm64`. Creating it does not remove or
-modify the source volume. Only initialization uses a privileged container;
-build shells and commands are unprivileged.
+The default output name is
+`jetson-cross-sdk-jp6.2.1-l4t36.4.4-arm64.tar.gz`, matching the volume name.
+Creating an archive does not remove or modify the source volume, and restoring
+one extracts into the volume of the resolved version. Only initialization uses a
+privileged container; archiving, restoring, build shells and commands are all
+unprivileged.
 
 Set `JETSON_PROJECT_DIR` to mount a source directory other than the current
 directory at `/workspace`.

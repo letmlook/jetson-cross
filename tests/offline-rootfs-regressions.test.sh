@@ -54,10 +54,16 @@ grep -Fq -- '-B"$root/usr/lib/aarch64-linux-gnu/"' "$script"
 grep -Fq 'cuda-$cuda_version/bin/nvcc' "$script"
 grep -Fq 'if [[ -z $nvcc ]] && ! $native_arm64; then' "$script"
 
-# A container run writes paths consumed later on the host. Allow those paths
-# to be supplied separately from the paths used while the script is running.
-grep -Fq 'JETSON_SDK_ACTIVATE_PATH' "$script"
-grep -Fq 'JETSON_NVCC_ACTIVATE_PATH' "$script"
+# A container run writes paths consumed later on the host. The activation file
+# must therefore resolve everything from its own location instead of baking in
+# a host path that only made sense during installation.
+grep -Fq 'BASH_SOURCE[0]' "$script"
+grep -Fq 'JETSON_ROOTFS="$JETSON_SDK/Linux_for_Tegra/rootfs"' "$script"
+! grep -Fq 'JETSON_SDK_ACTIVATE_PATH' "$script"
+# The host nvcc lives outside the SDK, so it stays overridable, but at source
+# time rather than at generation time.
+! grep -Fq 'JETSON_NVCC_ACTIVATE_PATH' "$script"
+grep -Fq 'JETSON_NVCC' "$script"
 
 # The generated activation helper must be directly executable as well as
 # sourceable by an interactive shell.

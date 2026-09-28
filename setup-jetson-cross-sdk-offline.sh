@@ -281,7 +281,10 @@ if rootfs_exec /bin/sh -c \
 else
   log "WARNING: nvidia-jetpack-dev is unavailable for this release"
   log '         Falling back to the explicit component list'
-  rootfs_packages="cuda-toolkit-12-6 cuda-libraries-dev-12-6 libnvinfer-dev libnvinfer-bin libcudnn9-cuda-12 libcudnn9-dev-cuda-12 libcudnn9-samples nvidia-vpi-dev"
+  # Derive the versioned names from the repository default instead of pinning
+  # 12-6, so the fallback is also correct on other JetPack releases.
+  cuda_major=${cuda_suffix%%-*}
+  rootfs_packages="cuda-toolkit-$cuda_suffix cuda-libraries-dev-$cuda_suffix libnvinfer-dev libnvinfer-bin libcudnn9-cuda-$cuda_major libcudnn9-dev-cuda-$cuda_major libcudnn9-samples nvidia-vpi-dev"
   if $native_arm64; then rootfs_packages="cuda-nvcc-$cuda_suffix $rootfs_packages"; fi
   rootfs_exec /bin/sh -c \
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $rootfs_packages"
@@ -400,6 +403,8 @@ case "$__jetson_nvcc_rel" in
   /*) CUDACXX=$__jetson_nvcc_rel ;;
   *)  CUDACXX="$JETSON_SDK/$__jetson_nvcc_rel" ;;
 esac
+# The host nvcc lives outside the SDK, so allow overriding it at source time.
+[ -n "${JETSON_NVCC:-}" ] && CUDACXX=$JETSON_NVCC
 unset __jetson_nvcc_rel
 export JETSON_SDK JETSON_ROOTFS JETSON_CROSS
 export CROSS_COMPILE="$JETSON_CROSS"

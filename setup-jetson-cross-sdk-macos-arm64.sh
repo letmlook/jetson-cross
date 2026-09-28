@@ -9,9 +9,10 @@ usage() {
   cat >&2 <<EOF
 Usage:
   $0 init [JETPACK_OR_L4T_VERSION]
-  $0 image [JETPACK_OR_L4T_VERSION]
-  $0 shell [--image] [JETPACK_OR_L4T_VERSION]
-  $0 run [--image] [JETPACK_OR_L4T_VERSION] COMMAND [ARG ...]
+  $0 archive [JETPACK_OR_L4T_VERSION] [OUTPUT.tar.gz]
+  $0 restore [JETPACK_OR_L4T_VERSION] ARCHIVE.tar.gz
+  $0 shell [JETPACK_OR_L4T_VERSION]
+  $0 run [JETPACK_OR_L4T_VERSION] COMMAND [ARG ...]
 
 The default version is JetPack $DEFAULT_JETPACK_VERSION.
 EOF
@@ -24,15 +25,9 @@ log() { printf '\n==> %s\n' "$*"; }
 [[ $# -ge 1 ]] || usage
 action=$1
 shift
-case "$action" in init|image|shell|run) ;; *) usage ;; esac
+case "$action" in init|archive|restore|shell|run) ;; *) usage ;; esac
 
-use_image=false
-if [[ ${1:-} = --image ]]; then
-  use_image=true
-  shift
-fi
-if [[ $action = init || $action = image ]] && $use_image; then usage; fi
-
+archive_path=
 version_input=
 if [[ $action = run ]]; then
   if [[ ${1:-} =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
@@ -40,6 +35,16 @@ if [[ $action = run ]]; then
     shift
   fi
   [[ $# -gt 0 ]] || usage
+elif [[ $action = archive || $action = restore ]]; then
+  if [[ $# -gt 0 ]]; then
+    version_input=$1
+    shift
+  fi
+  if [[ $# -gt 0 ]]; then
+    archive_path=$1
+    shift
+  fi
+  [[ $# -eq 0 ]] || usage
 else
   if [[ $# -gt 0 ]]; then
     version_input=$1
@@ -88,7 +93,7 @@ l4t_major=${L4T_VERSION%%.*}
 if [[ $l4t_major = 35 ]]; then host_ubuntu=20.04; else host_ubuntu=22.04; fi
 base_image=${JETSON_CROSS_BASE_IMAGE:-jetson-cross-sdk-base:macos-arm64-ubuntu${host_ubuntu}}
 volume="jetson-cross-sdk-${JETSON_VERSION_SLUG}-arm64"
-snapshot_image="jetson-cross-sdk:${JETSON_VERSION_SLUG}-arm64"
+default_archive="jetson-cross-sdk-${JETSON_VERSION_SLUG}-arm64.tar.gz"
 project_dir=${JETSON_PROJECT_DIR:-$PWD}
 
 if [[ -n $JETPACK_VERSION ]]; then
@@ -131,46 +136,62 @@ case "$action" in
       /opt/jetson-cross/setup-jetson-cross-sdk-offline.sh \
       "${version_input:-$DEFAULT_JETPACK_VERSION}" /opt/jetson-sdk
     ;;
-  image)
+  archive)
     ensure_base_image
     ensure_volume
     check_volume_ready
-    snapshot_container="jetson-cross-snapshot-${JETSON_VERSION_SLUG//./-}-$$"
-    cleanup_snapshot() { docker rm -f "$snapshot_container" >/dev/null 2>&1 || true; }
-    trap cleanup_snapshot EXIT
-    log "Copying $volume into $snapshot_image"
-    snapshot_id=$(docker create --platform linux/arm64 --name "$snapshot_container" \
-      -v "$volume:/source-sdk:ro" "$base_image" sleep infinity)
-    docker start "$snapshot_id" >/dev/null
-    docker exec "$snapshot_id" sh -c \
-      'mkdir -p /opt/jetson-sdk && cp -a /source-sdk/. /opt/jetson-sdk/'
-    docker commit \
-      --change "LABEL org.opencontainers.image.version=$JETSON_VERSION_SLUG" \
-      --change "LABEL com.nvidia.jetson.l4t=$L4T_VERSION" \
-      "$snapshot_id" "$snapshot_image" >/dev/null
-    cleanup_snapshot
-    trap - EXIT
-    log "Image ready: $snapshot_image"
+    out=${archive_path:-"$PWD/$default_archive"}
+    [[ $out = /* ]] || out="$PWD/$out"
+    mkdir -p "$(dirname "$out")"
+    log "Archiving $volume into $out"
+    # The sysroot is root-owned, so tar runs as root inside the container to
+    # keep ownership intact. No privileged container is required.
+    docker run --rm --platform linux/arm64 \
+      ${proxy_run_args[@]+"${proxy_run_args[@]}"} \
+      -e ARCHIVE_NAME="$(basename "$out")" \
+      -v "$volume:/source-sdk:ro" \
+      -v "$(dirname "$out"):/out" "$base_image" \
+      sh -c 'tar czf "/out/$ARCHIVE_NAME" -C /source-sdk .'
+    log "Archive ready: $out"
+    if [[ -f $out ]]; then
+      log "    size: $(du -h "$out" | awk '{print $1}')"
+    else
+      log "WARNING: $out was not created"
+    fi
+    ;;
+  restore)
+    [[ -n $archive_path ]] \
+      || die "Usage: $0 restore [JETPACK_OR_L4T_VERSION] ARCHIVE.tar.gz"
+    [[ -f $archive_path ]] || die "Archive not found: $archive_path"
+    archive_abs=$(cd "$(dirname "$archive_path")" && pwd)/$(basename "$archive_path")
+    ensure_base_image
+    ensure_volume
+    if docker run --rm --platform linux/arm64 \
+        ${proxy_run_args[@]+"${proxy_run_args[@]}"} \
+        -v "$volume:/target" "$base_image" test -f /target/.setup-complete 2>/dev/null; then
+      log "WARNING: $volume already holds an initialized SDK; extracting over it"
+    fi
+    log "Restoring $archive_abs into $volume"
+    docker run --rm --platform linux/arm64 \
+      ${proxy_run_args[@]+"${proxy_run_args[@]}"} \
+      -e ARCHIVE_NAME="$(basename "$archive_abs")" \
+      -v "$volume:/target" \
+      -v "$(dirname "$archive_abs"):/archive:ro" "$base_image" \
+      sh -c 'tar xzf "/archive/$ARCHIVE_NAME" -C /target'
+    check_volume_ready
+    log "Restore complete. Build with: $0 shell ${version_input:-$DEFAULT_JETPACK_VERSION}"
     ;;
   shell|run)
-    mounts=(-v "$project_dir:/workspace" -w /workspace)
-    if $use_image; then
-      docker image inspect "$snapshot_image" >/dev/null 2>&1 \
-        || die "Image $snapshot_image does not exist; run '$0 image ${version_input:-$DEFAULT_JETPACK_VERSION}' first"
-      runtime_image=$snapshot_image
-    else
-      ensure_base_image
-      ensure_volume
-      check_volume_ready
-      mounts=(-v "$volume:/opt/jetson-sdk" "${mounts[@]}")
-      runtime_image=$base_image
-    fi
+    ensure_base_image
+    ensure_volume
+    check_volume_ready
+    mounts=(-v "$volume:/opt/jetson-sdk" -v "$project_dir:/workspace" -w /workspace)
     if [[ $action = shell ]]; then
       exec docker run --rm -it --platform linux/arm64 \
-        ${proxy_run_args[@]+"${proxy_run_args[@]}"} "${mounts[@]}" "$runtime_image" bash
+        ${proxy_run_args[@]+"${proxy_run_args[@]}"} "${mounts[@]}" "$base_image" bash
     else
       exec docker run --rm --platform linux/arm64 \
-        ${proxy_run_args[@]+"${proxy_run_args[@]}"} "${mounts[@]}" "$runtime_image" "$@"
+        ${proxy_run_args[@]+"${proxy_run_args[@]}"} "${mounts[@]}" "$base_image" "$@"
     fi
     ;;
 esac
