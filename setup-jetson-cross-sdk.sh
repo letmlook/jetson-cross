@@ -112,6 +112,28 @@ for path in usr/include/opencv4/opencv2/core.hpp usr/include/gstreamer-1.0/gst/g
   [[ -f $SDK/sysroot/$path ]] || die "Target development header missing: /$path"
 done
 
+log 'Removing synced install caches and documentation'
+# rsync copies the device's package cache, package index, documentation and
+# translated catalogues, none of which a cross-compile can reach. Dropping them
+# keeps the synced sysroot close to the size of the headers and libraries it
+# actually exists for.
+for path in \
+  "$SDK/sysroot/var/cache/apt" \
+  "$SDK/sysroot/var/lib/apt/lists" \
+  "$SDK/sysroot/var/cache/debconf" \
+  "$SDK/sysroot/var/log" \
+  "$SDK/sysroot/usr/share/doc" \
+  "$SDK/sysroot/usr/share/man" \
+  "$SDK/sysroot/usr/share/info" \
+  "$SDK/sysroot/usr/share/locale" \
+  "$SDK/sysroot/usr/share/i18n"
+do
+  [[ -d $path ]] && find "$path" -mindepth 1 -delete 2>/dev/null || true
+done
+find "$SDK/sysroot" -type f -name '*.pyc' -delete 2>/dev/null || true
+find "$SDK/sysroot" -type d -name __pycache__ -prune \
+  -exec find {} -mindepth 1 -delete \; 2>/dev/null || true
+
 log 'Making absolute symlinks self-contained inside the host sysroot'
 python3 - "$SDK/sysroot" <<'PY'
 import os, pathlib, sys

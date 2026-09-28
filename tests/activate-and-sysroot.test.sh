@@ -117,6 +117,24 @@ grep -Fq 'apt-get remove -y --no-install-recommends nvidia-opencv-dev nvidia-ope
 grep -Fq -- '--allow-downgrades' "$offline"
 grep -Fq 'libopencv-dev=4.5.4+dfsg-9ubuntu4' "$offline"
 
+# --------------------------------------------------------- SDK slimming
+# A finished SDK carries several GB of install-only material that no compiler
+# can reach. It must be removed, and only after the smoke tests have run.
+grep -Fq 'slim_sdk()' "$offline"
+grep -Fq 'slim_sdk "$sdk" "$root"' "$offline"
+grep -Fq 'var/cache/apt' "$offline"
+grep -Fq 'var/lib/apt/lists' "$offline"
+grep -Fq 'usr/share/doc' "$offline"
+grep -Fq "downloads" "$offline"
+# It must run after the smoke tests, which are the only proof the SDK works.
+slim_line=$(grep -n 'slim_sdk "$sdk" "$root"' "$offline" | cut -d: -f1)
+smoke_line=$(grep -n 'smoke-cudnn-aarch64' "$offline" | tail -1 | cut -d: -f1)
+[[ -n $slim_line && -n $smoke_line && $slim_line -gt $smoke_line ]] \
+  || { echo 'FAIL: slimming must run after the smoke tests' >&2; exit 1; }
+# The online wrapper rsyncs the same material off a live device.
+grep -Fq 'Removing synced install caches and documentation' "$online"
+grep -Fq '$SDK/sysroot/var/cache/apt' "$online"
+
 # The default release is JetPack 6.1.
 grep -Fq 'DEFAULT_JETPACK_VERSION=6.1' lib/jetson-versions.sh
 

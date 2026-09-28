@@ -625,6 +625,40 @@ printf '#include <cudnn.h>\nint main(){return (int)cudnnGetVersion();}\n' \
 file "$sdk/smoke-cudnn-aarch64"
 "${cross}readelf" -d "$sdk/smoke-cudnn-aarch64" | grep -q 'libcudnn' \
   || die 'cuDNN smoke test did not link against the sysroot libcudnn'
+
+# A completed SDK carries roughly 7 GB of material that cannot affect a
+# cross-compile: the downloaded BSP and Sample RootFS archives, the apt cache
+# and package index, documentation, manual pages and translated catalogues.
+# Drop them once the SDK is verified, so a copied or archived SDK stays
+# reasonably sized. Nothing removed here is reachable from a compiler include
+# or link path.
+slim_sdk() {
+  local sdk_dir=$1 root_dir=$2 path
+  # find -delete rather than rm -rf: it never recurses above the given path.
+  if [[ -d $sdk_dir/downloads ]]; then
+    sudo find "$sdk_dir/downloads" -mindepth 1 -delete 2>/dev/null || true
+  fi
+  for path in \
+    "$root_dir/var/cache/apt" \
+    "$root_dir/var/lib/apt/lists" \
+    "$root_dir/var/cache/debconf" \
+    "$root_dir/var/log" \
+    "$root_dir/usr/share/doc" \
+    "$root_dir/usr/share/man" \
+    "$root_dir/usr/share/info" \
+    "$root_dir/usr/share/locale" \
+    "$root_dir/usr/share/i18n" \
+    "$root_dir/opt/ota_package"
+  do
+    [[ -d $path ]] && sudo find "$path" -mindepth 1 -delete 2>/dev/null || true
+  done
+  # Compiled Python bytecode is rebuilt on the target and is never linked.
+  sudo find "$root_dir" -type f -name '*.pyc' -delete 2>/dev/null || true
+  sudo find "$root_dir" -type d -name __pycache__ -prune \
+    -exec find {} -mindepth 1 -delete \; 2>/dev/null || true
+}
+log 'Removing install-only caches and documentation'
+slim_sdk "$sdk" "$root"
 touch "$sdk/.setup-complete"
 log "SDK ready: source '$sdk/activate.sh'"
 echo "cmake -S PROJECT -B BUILD -DCMAKE_TOOLCHAIN_FILE='$sdk/toolchain.cmake'"
