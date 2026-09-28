@@ -274,6 +274,15 @@ file "$SDK/example/build/jetson_sdk_check"
 "${cross}readelf" -h "$SDK/example/build/jetson_sdk_check" | grep 'Machine:.*AArch64' >/dev/null \
   || die 'Verification failed: output is not AArch64'
 "$nvcc" --version | tail -n 1
+# Ship the usage guide inside the SDK so a copied or archived SDK carries its
+# own documentation.
+sdk_guide="$script_dir/docs/使用说明.md"
+if [[ -f $sdk_guide ]]; then
+  install -m 0644 "$sdk_guide" "$SDK/使用说明.md"
+else
+  log "WARNING: $sdk_guide not found; the SDK will ship without a usage guide"
+fi
 log "Ready. Run: source '$SDK/activate.sh'"
 echo "Build: cmake -S /path/to/project -B /path/to/build -G Ninja -DCMAKE_TOOLCHAIN_FILE='$SDK/toolchain.cmake'"
+echo "Full usage guide: $SDK/使用说明.md"
 echo "Target test: scp '$SDK/example/build/jetson_sdk_check' '$TARGET:/tmp/' && ssh '$TARGET' /tmp/jetson_sdk_check"

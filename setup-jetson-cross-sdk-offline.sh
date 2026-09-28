@@ -659,7 +659,17 @@ slim_sdk() {
 }
 log 'Removing install-only caches and documentation'
 slim_sdk "$sdk" "$root"
+
+# Ship the usage guide inside the SDK. A copied or archived SDK carries its own
+# documentation, so it stays usable away from the repository it was built from.
+sdk_guide="$script_dir/docs/使用说明.md"
+if [[ -f $sdk_guide ]]; then
+  install -m 0644 "$sdk_guide" "$sdk/使用说明.md"
+else
+  log "WARNING: $sdk_guide not found; the SDK will ship without a usage guide"
+fi
+
 touch "$sdk/.setup-complete"
 log "SDK ready: source '$sdk/activate.sh'"
 echo "cmake -S PROJECT -B BUILD -DCMAKE_TOOLCHAIN_FILE='$sdk/toolchain.cmake'"
-echo "Full usage guide: see docs/使用说明.md in the jetson-cross repository."
+echo "Full usage guide: $sdk/使用说明.md"

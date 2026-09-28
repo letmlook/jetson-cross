@@ -135,6 +135,16 @@ smoke_line=$(grep -n 'smoke-cudnn-aarch64' "$offline" | tail -1 | cut -d: -f1)
 grep -Fq 'Removing synced install caches and documentation' "$online"
 grep -Fq '$SDK/sysroot/var/cache/apt' "$online"
 
+# ------------------------------------------------------- usage guide in the SDK
+# A copied or archived SDK must carry its own documentation, not depend on the
+# repository it was generated from.
+grep -Fq 'docs/使用说明.md' "$offline"
+grep -Fq '"$sdk/使用说明.md"' "$offline"
+grep -Fq 'docs/使用说明.md' "$online"
+grep -Fq '"$SDK/使用说明.md"' "$online"
+# The guide the scripts copy must actually exist in the repository.
+[[ -f lib/../docs/使用说明.md ]] || { echo 'FAIL: docs/使用说明.md missing' >&2; exit 1; }
+
 # The default release is JetPack 6.1.
 grep -Fq 'DEFAULT_JETPACK_VERSION=6.1' lib/jetson-versions.sh
 

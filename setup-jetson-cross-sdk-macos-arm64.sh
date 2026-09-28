@@ -9,8 +9,8 @@ usage() {
   cat >&2 <<EOF
 Usage:
   $0 init [JETPACK_OR_L4T_VERSION]
-  $0 archive [JETPACK_OR_L4T_VERSION] [OUTPUT.tar.gz]
-  $0 restore [JETPACK_OR_L4T_VERSION] ARCHIVE.tar.gz
+  $0 archive [JETPACK_OR_L4T_VERSION] [OUTPUT.tar.zst]
+  $0 restore [JETPACK_OR_L4T_VERSION] ARCHIVE.tar.zst
   $0 shell [JETPACK_OR_L4T_VERSION]
   $0 run [JETPACK_OR_L4T_VERSION] COMMAND [ARG ...]
 
@@ -93,7 +93,7 @@ l4t_major=${L4T_VERSION%%.*}
 if [[ $l4t_major = 35 ]]; then host_ubuntu=20.04; else host_ubuntu=22.04; fi
 base_image=${JETSON_CROSS_BASE_IMAGE:-jetson-cross-sdk-base:macos-arm64-ubuntu${host_ubuntu}}
 volume="jetson-cross-sdk-${JETSON_VERSION_SLUG}-arm64"
-default_archive="jetson-cross-sdk-${JETSON_VERSION_SLUG}-arm64.tar.gz"
+default_archive="jetson-cross-sdk-${JETSON_VERSION_SLUG}-arm64.tar.zst"
 project_dir=${JETSON_PROJECT_DIR:-$PWD}
 
 if [[ -n $JETPACK_VERSION ]]; then
@@ -144,24 +144,27 @@ case "$action" in
     [[ $out = /* ]] || out="$PWD/$out"
     mkdir -p "$(dirname "$out")"
     log "Archiving $volume into $out"
-    # The sysroot is root-owned, so tar runs as root inside the container to
-    # keep ownership intact. No privileged container is required.
+    # zstd rather than gzip: on a real JetPack 6.1 SDK it produces a noticeably
+    # smaller archive at a similar speed. -T0 uses every core. The sysroot is
+    # root-owned, so tar runs as root inside the container to keep ownership
+    # intact; no privileged container is required.
     docker run --rm --platform linux/arm64 \
       ${proxy_run_args[@]+"${proxy_run_args[@]}"} \
       -e ARCHIVE_NAME="$(basename "$out")" \
       -v "$volume:/source-sdk:ro" \
       -v "$(dirname "$out"):/out" "$base_image" \
-      sh -c 'tar czf "/out/$ARCHIVE_NAME" -C /source-sdk .'
+      sh -c 'tar -cf - -C /source-sdk . | zstd -T0 -q -o "/out/$ARCHIVE_NAME"'
     log "Archive ready: $out"
     if [[ -f $out ]]; then
       log "    size: $(du -h "$out" | awk '{print $1}')"
+      log "    extract with: tar --zstd -xf $(basename "$out")"
     else
       log "WARNING: $out was not created"
     fi
     ;;
   restore)
     [[ -n $archive_path ]] \
-      || die "Usage: $0 restore [JETPACK_OR_L4T_VERSION] ARCHIVE.tar.gz"
+      || die "Usage: $0 restore [JETPACK_OR_L4T_VERSION] ARCHIVE.tar.zst"
     [[ -f $archive_path ]] || die "Archive not found: $archive_path"
     archive_abs=$(cd "$(dirname "$archive_path")" && pwd)/$(basename "$archive_path")
     ensure_base_image
@@ -177,7 +180,7 @@ case "$action" in
       -e ARCHIVE_NAME="$(basename "$archive_abs")" \
       -v "$volume:/target" \
       -v "$(dirname "$archive_abs"):/archive:ro" "$base_image" \
-      sh -c 'tar xzf "/archive/$ARCHIVE_NAME" -C /target'
+      sh -c 'tar --zstd -xf "/archive/$ARCHIVE_NAME" -C /target'
     check_volume_ready
     log "Restore complete. Build with: $0 shell ${version_input:-$DEFAULT_JETPACK_VERSION}"
     ;;
