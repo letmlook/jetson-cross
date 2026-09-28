@@ -8,6 +8,9 @@ set -euo pipefail
 offline=./setup-jetson-cross-sdk-offline.sh
 online=./setup-jetson-cross-sdk.sh
 
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
 # ---------------------------------------------------------------- activate.sh
 # The activation file must not bake in the directory it was generated in, or the
 # SDK stops working as soon as it is moved, copied or mounted elsewhere.
@@ -96,18 +99,58 @@ grep -Fq '#include <cudnn.h>' "$offline"
 grep -Fq 'did not link against the sysroot libcudnn' "$offline"
 
 # ------------------------------------------------------- nvidia-* JetPack bundle
-# The Jetson repository ships its own build of nvidia-jetpack-dev and of every
-# nvidia-* package it depends on, so apt must resolve the set without a manual
-# version pin, and the explicit component list stays as a fallback.
-grep -Fq 'apt-cache show nvidia-jetpack-dev' "$offline"
-grep -Fq 'apt-get install -y --no-install-recommends nvidia-jetpack-dev"' "$offline"
-grep -Fq 'Falling back to the explicit component list' "$offline"
-! grep -Fq 'nvidia-jetpack-dev=$' "$offline"
+# The repository serves one bundle build per JetPack release side by side, so
+# an unpinned install would give the default 6.1 SDK the newest bundle. The
+# build must follow the resolved version, and the whole exact-version
+# dependency closure must be pinned at what each parent declares.
+grep -Fq 'apt-cache madison nvidia-jetpack-dev' "$offline"
+grep -Fq 'jetpack_dev_build=' "$offline"
+grep -Fq "jetpack_dev_queue=(\"nvidia-jetpack-dev=\$jetpack_dev_build\")" "$offline"
+grep -Fq 'jetpack_dep_re=' "$offline"
+grep -Fq 'apt-get install -y --no-install-recommends --allow-downgrades $jetpack_dev_pinned' "$offline"
+# An unmatched release must still produce a usable SDK.
+grep -Fq 'Falling back to the unpinned bundle' "$offline"
+grep -Fq 'libcudnn9-dev-cuda-$cuda_major' "$offline"
 # nvidia-jetpack-dev pins the broken NVIDIA libopencv-dev 4.8.0, so the bundle
 # must be dropped before the working Ubuntu 4.5 ABI is installed.
 grep -Fq 'apt-get remove -y --no-install-recommends nvidia-opencv-dev nvidia-opencv' "$offline"
 grep -Fq -- '--allow-downgrades' "$offline"
 grep -Fq 'libopencv-dev=4.5.4+dfsg-9ubuntu4' "$offline"
+
+# The default release is JetPack 6.1.
+grep -Fq 'DEFAULT_JETPACK_VERSION=6.1' lib/jetson-versions.sh
+
+# The build-selection and closure-pinning logic, exercised against a recorded
+# apt-cache madison listing. Guards against the silent upgrade that would give
+# a 6.1 SDK the 6.2.1 bundle.
+cat > "$tmp/madison" <<'EOF'
+nvidia-jetpack-dev |  6.2.1+b38 | https://repo.download.nvidia.com/jetson/common r36.4/main arm64 Packages
+nvidia-jetpack-dev |    6.2+b77 | https://repo.download.nvidia.com/jetson/common r36.4/main arm64 Packages
+nvidia-jetpack-dev |   6.1+b123 | https://repo.download.nvidia.com/jetson/common r36.4/main arm64 Packages
+EOF
+select_build() {
+  sed -n "s/^[^|]*|[[:space:]]*\($1+b[^[:space:]|]*\)[[:space:]]*|.*/\1/p" "$tmp/madison" | head -n 1
+}
+[[ $(select_build 6.1) == 6.1+b123 ]]
+[[ $(select_build 6.2) == 6.2+b77 ]]
+[[ $(select_build 6.2.1) == 6.2.1+b38 ]]
+# 6.2 must not swallow 6.2.1, and an unlisted release must fall back.
+[[ -z $(select_build 5.1.7) ]]
+
+# Dependency parsing must keep the declared version and reject anything that
+# is not an exact constraint.
+dep_re='^[[:space:]]*([[:alnum:]][[:alnum:].+-]*) \(= ([^)]+)\)[[:space:]]*$'
+resolve_dep() {
+  [[ $1 =~ $dep_re ]] || return 1
+  printf '%s=%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+# Leading whitespace appears once the Depends line is split on commas.
+[[ $(resolve_dep ' nvidia-cudnn9 (= 6.1+b123)') == nvidia-cudnn9=6.1+b123 ]]
+# L4T packages carry an L4T version, not the JetPack build string.
+[[ $(resolve_dep 'nvidia-l4t-gstreamer (= 36.4.0-1)') == nvidia-l4t-gstreamer=36.4.0-1 ]]
+# Non-exact constraints carry no usable pin.
+! resolve_dep 'nvidia-something (>= 1.0)' >/dev/null
+! resolve_dep 'libcudnn9-samples (= 9.3.0.75-1), other' >/dev/null
 
 # ----------------------------------------------------------------- toolchain.cmake
 # The offline script must still write an executable activation file.
@@ -116,9 +159,6 @@ grep -Fq 'chmod 0755 "$SDK/activate.sh"' "$online"
 
 # ------------------------------------------------------------ generated output
 # Rendering both generated files must not fail or emit empty bodies.
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-
 sdk="$tmp/sdk"
 mkdir -p "$sdk"
 root="$sdk/Linux_for_Tegra/rootfs"

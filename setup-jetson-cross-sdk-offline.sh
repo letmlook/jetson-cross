@@ -262,14 +262,59 @@ cuda_suffix=$(rootfs_exec /bin/sh -c \
 [[ $cuda_suffix =~ ^[0-9]+-[0-9]+$ ]] \
   || die 'Could not resolve the default versioned CUDA development package'
 # Install the JetPack development stack from NVIDIA's own nvidia-* bundle.
-# nvidia-jetpack-dev aggregates VPI, CUDA, TensorRT, cuDNN and OpenCV. Each
-# Jetson release ships its own build of the bundle and of every nvidia-* package
-# it depends on, so apt resolves the matching set on its own.
-if rootfs_exec /bin/sh -c \
-  "apt-cache show nvidia-jetpack-dev >/dev/null 2>&1"; then
-  log 'Installing NVIDIA JetPack development bundle (nvidia-jetpack-dev)'
+# NVIDIA keeps one build of nvidia-jetpack-dev, and of every nvidia-* package
+# it depends on, per JetPack release ("<jp>+b<build>"). The repository serves
+# all of them at once, so an unpinned install silently pulls the newest bundle,
+# for example 6.2.1's, even when the requested release is 6.1. Select the build
+# matching the resolved JetPack version instead.
+#
+# The component names also change between releases (nvidia-cudnn9-dev on 6.1
+# versus nvidia-cudnn-dev on 6.2), so the pinned set is derived from the
+# bundle's own Depends rather than hardcoded.
+jetpack_dev_build=
+if [[ -n $JETPACK_VERSION ]]; then
+  # apt-cache madison right-aligns the version column, so match on whitespace.
+  jetpack_dev_build=$(rootfs_exec /bin/sh -c \
+    "apt-cache madison nvidia-jetpack-dev 2>/dev/null" \
+    | sed -n "s/^[^|]*|[[:space:]]*\($JETPACK_VERSION+b[^[:space:]|]*\)[[:space:]]*|.*/\1/p" \
+    | head -n 1)
+fi
+if [[ -n $jetpack_dev_build ]]; then
+  log "Installing NVIDIA JetPack development bundle $jetpack_dev_build for JetPack $JETPACK_VERSION"
+  # Pin the whole exact-version dependency closure, not just the direct
+  # dependencies of the bundle. nvidia-jetpack-runtime alone pulls
+  # nvidia-container, nvidia-cupva, nvidia-opencv, nvidia-tensorrt,
+  # nvidia-vpi and nvidia-cuda, and those in turn pin libnvidia-container*,
+  # pva-allow-2 and cupva-2.5-l4t. Left to itself apt picks the newest version
+  # of those and reports held broken packages. Each package is pinned at the
+  # version its parent declares, which is also why the closure must not assume
+  # a single build string: nvidia-* L4T packages are versioned by L4T instead.
+  jetpack_dev_pinned=
+  jetpack_dev_seen=' '
+  jetpack_dev_count=0
+  # Kept in a variable: an unquoted ")" inside [[ =~ ]] would end the pattern.
+  jetpack_dep_re='^[[:space:]]*([[:alnum:]][[:alnum:].+-]*) \(= ([^)]+)\)[[:space:]]*$'
+  jetpack_dev_queue=("nvidia-jetpack-dev=$jetpack_dev_build")
+  while [[ ${#jetpack_dev_queue[@]} -gt 0 ]]; do
+    spec=${jetpack_dev_queue[0]}
+    jetpack_dev_queue=("${jetpack_dev_queue[@]:1}")
+    name=${spec%%=*}
+    [[ $jetpack_dev_seen == *" $name "* ]] && continue
+    jetpack_dev_seen+="$name "
+    jetpack_dev_pinned+="${jetpack_dev_pinned:+ }$spec"
+    (( ++jetpack_dev_count > 400 )) && break
+    while IFS= read -r dep; do
+      # Only exact "name (= version)" constraints carry a usable pin.
+      [[ $dep =~ $jetpack_dep_re ]] || continue
+      jetpack_dev_queue+=("${BASH_REMATCH[1]}=${BASH_REMATCH[2]}")
+    done < <(rootfs_exec /bin/sh -c "apt-cache show $spec 2>/dev/null" \
+      | sed -n 's/^Depends: //p' | tr ',' '\n')
+  done
+  log "Pinning $jetpack_dev_count packages at their declared versions"
+  # --allow-downgrades matters when an SDK directory is re-initialised for an
+  # older JetPack than the bundle already present in it.
   rootfs_exec /bin/sh -c \
-    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nvidia-jetpack-dev"
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-downgrades $jetpack_dev_pinned"
   # nvidia-jetpack-dev pulls nvidia-opencv-dev, which pins the Jetson repo's
   # libopencv-dev 4.8.0. That build is broken on JetPack 6.1: its
   # libopencv-*.so.408 links point at runtime libraries the repo never
@@ -279,15 +324,20 @@ if rootfs_exec /bin/sh -c \
     "DEBIAN_FRONTEND=noninteractive apt-get remove -y --no-install-recommends nvidia-opencv-dev nvidia-opencv libopencv-dev libopencv-python libopencv-samples opencv-licenses opencv-samples-data" \
     || log 'WARNING: could not remove the NVIDIA OpenCV bundle; the OpenCV step below may fail'
 else
-  log "WARNING: nvidia-jetpack-dev is unavailable for this release"
-  log '         Falling back to the explicit component list'
-  # Derive the versioned names from the repository default instead of pinning
-  # 12-6, so the fallback is also correct on other JetPack releases.
-  cuda_major=${cuda_suffix%%-*}
-  rootfs_packages="cuda-toolkit-$cuda_suffix cuda-libraries-dev-$cuda_suffix libnvinfer-dev libnvinfer-bin libcudnn9-cuda-$cuda_major libcudnn9-dev-cuda-$cuda_major libcudnn9-samples nvidia-vpi-dev"
-  if $native_arm64; then rootfs_packages="cuda-nvcc-$cuda_suffix $rootfs_packages"; fi
+  log "WARNING: no nvidia-jetpack-dev build matches JetPack ${JETPACK_VERSION:-unknown}"
+  log '         Falling back to the unpinned bundle, then the explicit list'
   rootfs_exec /bin/sh -c \
-    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $rootfs_packages"
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nvidia-jetpack-dev" \
+    || {
+      log '         The unpinned bundle is unavailable; using the component list'
+      # Derive the versioned names from the repository default instead of
+      # pinning 12-6, so the fallback is also correct on other releases.
+      cuda_major=${cuda_suffix%%-*}
+      rootfs_packages="cuda-toolkit-$cuda_suffix cuda-libraries-dev-$cuda_suffix libnvinfer-dev libnvinfer-bin libcudnn9-cuda-$cuda_major libcudnn9-dev-cuda-$cuda_major libcudnn9-samples nvidia-vpi-dev"
+      if $native_arm64; then rootfs_packages="cuda-nvcc-$cuda_suffix $rootfs_packages"; fi
+      rootfs_exec /bin/sh -c \
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $rootfs_packages"
+    }
 fi
 # GStreamer and FFmpeg development headers are not part of the nvidia-* bundle.
 rootfs_exec /bin/sh -c \
