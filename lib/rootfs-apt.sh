@@ -8,8 +8,16 @@
 #
 # Does an `apt-get update` then installs:
 #   - nvidia-jetpack-dev        (the umbrella JetPack development bundle)
-#   - GStreamer + FFmpeg dev    (not bundled with nvidia-jetpack-dev)
-#   - cuda-crt                  (compiler-internal CUDA headers; warn-only)
+#   - GStreamer + FFmpeg dev    (not bundled with nvidia-jetpack-dev);
+#                               includes libavfilter-dev / libavdevice-dev
+#                               so pkg_check_modules(... REQUIRED) on those
+#                               two does not fail at configure time
+#   - cuda-crt                  (compiler-internal CUDA headers)
+#   - libnvonnxparsers-dev      (ONNX parser: the -dev package is what
+#                               ships the unversioned .so symlink and the
+#                               NvOnnxParser.h / NvOnnxConfig.h headers;
+#                               without it find_library(nvonnxparser)
+#                               fails and the converter tool cannot build)
 #   - OpenCV 4.5 ABI            (the NVIDIA one links to runtime libs that
 #                                the Jetson repo never published, so we drop
 #                                it and install the Ubuntu ABI explicitly)
@@ -17,6 +25,10 @@
 # All installs are by package name only. Jetson repo versions each
 # package by the L4T/JetPack release, so the right version is selected
 # automatically.
+#
+# Constraint this function enforces: any library whose runtime package is
+# installed must also have its -dev package installed, otherwise the SDK
+# links but cannot compile against it.
 install_rootfs_dev_stack() {
   local root=$1 cuda_suffix=$2
   rootfs_exec "$root" /bin/sh -c 'apt-get update'
@@ -25,11 +37,46 @@ install_rootfs_dev_stack() {
        nvidia-jetpack-dev \
        libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
        libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+       libavfilter-dev libavdevice-dev \
        cuda-crt-${cuda_suffix} \
+       libnvonnxparsers-dev \
        libopencv-core4.5d libopencv-imgproc4.5d libopencv-dnn4.5d libopencv-dev" \
     || {
       warn 'Some packages were unavailable; the SDK may compile a subset of the development stack'
     }
+  # libnvdla_compiler.so ships with the L4T DLA runtime but is not pulled
+  # in by nvidia-jetpack-dev on every release. Without it, libnvinfer.so's
+  # NEEDED entry cannot be resolved and linking a TensorRT program dies on
+  # unresolved nvdla:: symbols. Try to install it; when the repo does not
+  # offer it, callers must pass -Wl,--allow-shlib-undefined (documented in
+  # the SDK usage guide).
+  rootfs_exec "$root" /bin/sh -c \
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libnvdla-compiler" \
+    || warn 'libnvdla-compiler not in the repo; TensorRT links will need -Wl,--allow-shlib-undefined'
+}
+
+# fix_cuda_alternatives <root> <cuda_version>
+#
+# NVIDIA's CUDA packages register /usr/local/cuda through Debian
+# alternatives, which leaves absolute symlinks into /etc/alternatives.
+# When the rootfs is used as a cross-compile sysroot on a host that also
+# has a CUDA toolkit, those links resolve to the HOST's CUDA (x86_64
+# libs), so find_library(cudart) picks up the wrong architecture and the
+# link fails with `file in wrong format`. Rewrite both /usr/local/cuda
+# and /usr/local/cuda-<major> to point at the versioned toolkit directory
+# inside the rootfs, matching what alternatives would resolve to on a
+# real Jetson device.
+fix_cuda_alternatives() {
+  local root=$1 cuda_version=$2
+  local target="cuda-${cuda_version}"
+  local major="cuda-${cuda_version%%.*}"
+  if [[ -d $root/usr/local/$target ]]; then
+    sudo ln -sfn "$target" "$root/usr/local/cuda"
+    sudo ln -sfn "$target" "$root/usr/local/$major"
+    log "Rewrote $root/usr/local/cuda -> $target (aarch64 toolkit, no host escape)"
+  else
+    warn "$root/usr/local/$target is missing; /usr/local/cuda may resolve to the host CUDA toolkit"
+  fi
 }
 
 # probe_cudnn <root>

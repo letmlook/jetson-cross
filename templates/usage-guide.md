@@ -100,7 +100,14 @@ cmake -S ~/my-project -B ~/my-project/build -G Ninja \
 cmake --build ~/my-project/build
 ```
 
-`toolchain.cmake` 已经处理好了 sysroot、multiarch 头文件路径、库搜索路径和 CUDA 路径，通常不需要再传 `-DCMAKE_SYSROOT`。
+`toolchain.cmake` 已经处理好了 sysroot、multiarch 头文件路径、库搜索路径和 CUDA 路径，通常不需要你再传 `-DCMAKE_SYSROOT`。
+
+> **⚠ 编译侧绝对不要自己加 `--sysroot`**（`CMAKE_C_FLAGS_INIT` / `CMAKE_CXX_FLAGS_INIT`）。
+> Bootlin 工具链的 multilib 目录叫 `aarch64-buildroot-linux-gnu`，而 Ubuntu rootfs 的
+> multiarch 目录叫 `aarch64-linux-gnu`，二者不匹配。编译侧一旦再加一次 `--sysroot`，
+> `gnu/stubs.h`、`bits/libc-header-start.h` 就会找不到。
+> `toolchain.cmake` 已经把 `--sysroot` 只放在链接旗标里，编译头文件用工具链自带的
+> glibc 头（版本 ≤ rootfs 的库，正向兼容，安全）。
 
 ### 4.2 手写 g++ 命令
 
@@ -163,6 +170,33 @@ ${JETSON_CROSS}g++ --sysroot="$JETSON_ROOTFS" \
 ```
 
 > 除非显式设了 `JETSON_NVCC`，`CUDACXX` 已经指向 `<SDK>/bin/nvcc`，包装器会自动把 sysroot CUDA include 与 target lib 加进去，所以直接用 `nvcc kernel.cu -o kernel` 也行。
+
+### 5.1 宿主 toolkit 与 rootfs CUDA 的版本配套
+
+SDK 的 rootfs 带的是 JetPack 配套的 CUDA（JetPack 6.1 → CUDA 12.6），而开发机的宿主
+toolkit 版本可能是别的（例如 12.9）。两条规则：
+
+| 侧 | 取什么 | 原因 |
+|---|---|---|
+| **头文件** | 宿主 toolkit 的 `include/`（由 `cuda-crt-cross-aarch64` 提供，含 `crt/`） | 头文件与架构无关，宿主的更完整 |
+| **库** | rootfs 的 `targets/aarch64-linux/lib` | 必须是 aarch64，且与设备 CUDA 运行时严格配套 |
+
+实测"宿主 12.9 头 + rootfs 12.6 库"基础 API 可用（nvcc 与其自家头严格配套，库与设备
+运行时严格配套）。**建议把宿主 toolkit 版本对齐到 rootfs 的 CUDA 版本**以消除疑虑。
+`activate.sh` 导出的 `CUDAFLAGS` 已按上述规则配置。
+
+### 5.2 find_package(CUDA)（FindCUDA）交叉用法
+
+老式 CMake 工程用 `find_package(CUDA)` 而非 `enable_language(CUDA)`。这个模块在交叉
+模式下读两个环境变量，`activate.sh` 已经设好：
+
+| 变量 | 值 | 作用 |
+|---|---|---|
+| `CUDA_TOOLKIT_ROOT` | `<rootfs>/usr/local/cuda-<版本>` | 含 `targets/aarch64-linux` 的 toolkit 根 |
+| `CUDA_NVCC_EXECUTABLE` | 宿主可执行的 nvcc | FindCUDA 会跑 `nvcc --version` 解析版本 |
+
+> **禁止**用 `-DCUDA_TOOLKIT_TARGET_DIR=<宿主 toolkit>` 绕路：FindCUDA 会把它插到
+> `CMAKE_FIND_ROOT_PATH` 最前，导致工程里的 `find_library(cudart)` 先命中宿主 x86_64 库。
 
 ---
 
@@ -271,7 +305,38 @@ ls /path/to/sdk/Linux_for_Tegra/rootfs/usr/lib/aarch64-linux-gnu/libcudnn.so
 
 sysroot 与 CUDA 版本是绑定的。切换版本请重新运行 `jetson-cross build`，**不要**在旧 SDK 上改环境变量。
 
----
+### 8.7 TensorRT 链接报 `undefined reference to nvdla::...`
+
+`libnvinfer.so` 的 `NEEDED` 含 `libnvdla_compiler.so`，该库由 L4T 的 DLA 运行时栈提供，
+但不是每个 JetPack 版本的 `nvidia-jetpack-dev` 都会带上。构建脚本会尝试安装
+`libnvdla-compiler`，若仓库里没有，安装时会打印警告。
+
+此时链接 TensorRT 程序需要显式放行依赖库内部的未解析符号：
+
+```bash
+target_link_libraries(my_app PRIVATE -Wl,--allow-shlib-undefined ${TRT_LIB})
+```
+
+> `--allow-shlib-undefined` 只放行**依赖库内部**的未解析符号，你自己的目标文件符号
+> 仍然全部强校验，不会掩盖真实错误。
+
+### 8.8 rootfs 包集清单（哪些能 REQUIRED、哪些要可选）
+
+SDK rootfs 装齐了以下开发包，可以放心在 CMake 里写 `REQUIRED`：
+
+| 组件 | pkg-config 名 / 头 | 说明 |
+|---|---|---|
+| OpenCV 4.5 | `opencv4` | Ubuntu 4.5 ABI（NVIDIA 的 4.8 链接缺失，已替换） |
+| GStreamer 1.0 | `gstreamer-1.0` | |
+| FFmpeg | `libavformat` / `libavcodec` / `libavutil` / `libswscale` | |
+| FFmpeg 滤镜/设备 | `libavfilter` / `libavdevice` | 已装 `-dev`，可 REQUIRED |
+| TensorRT | `NvInfer.h` / `libnvinfer.so` | |
+| cuDNN | `cudnn.h` / `libcudnn.so` | |
+| ONNX Parser | `NvOnnxParser.h` / `libnvonnxparser.so` | 已装 `-dev`，含 `.so` 软链 |
+| CUDA 运行时 | `cuda_runtime.h` / `libcudart.so` | |
+
+> **原则**：rootfs 里装了 runtime 包的组件，都同时装了对应的 `-dev` 包。
+> 若发现某个库"运行时有、开发期没有"，是构建脚本漏装了 `-dev`，请反馈。
 
 ## 9. 迁移与备份
 

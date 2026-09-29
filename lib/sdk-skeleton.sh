@@ -3,12 +3,15 @@
 # symlinks, the nvcc wrapper, the example project, and the inline smoke
 # tests that prove a real cross-compile works.
 
-# generate_activate_sh <sdk> <rootfs_rel> <cross_rel> <nvcc_rel> <cuda_wrapper_rel> <jetpack> <l4t>
+# generate_activate_sh <sdk> <rootfs_rel> <cross_rel> <nvcc_rel> <cuda_wrapper_rel> <jetpack> <l4t> <cuda_version>
 #
 # Writes <sdk>/activate.sh from templates/activate.sh.tmpl. The five path
 # slots are stored as relative paths so the file survives being moved.
+# <cuda_version> is the major.minor CUDA release (e.g. 12.6) and is used
+# to point CUDA_TOOLKIT_ROOT at the versioned toolkit directory, which is
+# the only one guaranteed to contain targets/aarch64-linux.
 generate_activate_sh() {
-  local sdk=$1 rootfs_rel=$2 cross_rel=$3 nvcc_rel=$4 wrapper_rel=$5 jetpack=$6 l4t=$7
+  local sdk=$1 rootfs_rel=$2 cross_rel=$3 nvcc_rel=$4 wrapper_rel=$5 jetpack=$6 l4t=$7 cuda_version=${8:-}
   local template="$JETSON_CROSS_LIB_DIR/../templates/activate.sh.tmpl"
   install -m 0755 /dev/null "$sdk/activate.sh"
   sed \
@@ -18,6 +21,7 @@ generate_activate_sh() {
     -e "s|@CROSS_REL@|$cross_rel|g" \
     -e "s|@NVCC_REL@|$nvcc_rel|g" \
     -e "s|@CUDA_WRAPPER_REL@|$wrapper_rel|g" \
+    -e "s|@CUDA_VERSION@|$cuda_version|g" \
     "$template" > "$sdk/activate.sh"
   chmod 0755 "$sdk/activate.sh"
 }

@@ -28,6 +28,11 @@ esac
 __jetson_cuda_wrapper_rel='@CUDA_WRAPPER_REL@'
 # The host nvcc lives outside the SDK, so allow overriding it at source time.
 [ -n "${JETSON_NVCC:-}" ] && CUDACXX=$JETSON_NVCC
+# Capture the REAL nvcc before the wrapper override below: FindCUDA runs
+# `nvcc --version` on CUDA_NVCC_EXECUTABLE, so it must be an executable
+# that runs on the build host. The rootfs's nvcc is an aarch64 ELF and
+# would make FindCUDA's regex crash on empty output.
+CUDA_NVCC_EXECUTABLE=$CUDACXX
 # CMake's compiler-detection step (CMakeDetermineCompilerId) calls nvcc
 # directly with no toolchain flags, so it cannot reach sysroot CUDA headers
 # when the host nvcc lives outside the SDK. Route CUDACXX through a wrapper
@@ -41,6 +46,40 @@ export JETSON_SDK JETSON_ROOTFS JETSON_CROSS
 export CROSS_COMPILE="$JETSON_CROSS"
 export CUDACXX
 export CUDAHOSTCXX="${JETSON_CROSS}g++"
+
+# --- CUDA cross-build discovery variables ------------------------------
+# FindCUDA's cross-compiling branch (find_package(CUDA)) reads only these
+# two. Without them, configure either fails to locate CUDA_TOOLKIT_INCLUDE
+# or, worse, runs the rootfs's aarch64 nvcc on the host and crashes its
+# internal regex on empty output.
+#
+# CUDA_TOOLKIT_ROOT must be a toolkit root that CONTAINS
+# targets/aarch64-linux. The versioned directory is preferred over
+# /usr/local/cuda: the latter is a Debian alternatives symlink into
+# /etc/alternatives and resolves to the HOST toolkit on any machine that
+# has CUDA installed, silently handing find_library(cudart) x86_64 libs.
+CUDA_TOOLKIT_ROOT="$JETSON_ROOTFS/usr/local/cuda-@CUDA_VERSION@"
+if [ ! -d "$CUDA_TOOLKIT_ROOT/targets/aarch64-linux" ]; then
+  CUDA_TOOLKIT_ROOT="$JETSON_ROOTFS/usr/local/cuda"
+fi
+export CUDA_TOOLKIT_ROOT
+
+# CUDA_NVCC_EXECUTABLE was captured above before the wrapper override, so
+# it points at the real host nvcc even though CUDACXX now routes through
+# <SDK>/bin/nvcc.
+export CUDA_NVCC_EXECUTABLE
+
+# CUDAFLAGS: headers come from the toolkit that provides nvcc (they are
+# architecture independent and include the compiler-internal crt/ tree),
+# libraries must come from the rootfs aarch64 toolkit so the link output
+# is AArch64. find_package(CUDA) does not read this, but make/nvcc
+# driven projects do.
+__jetson_nvcc_home=${CUDA_NVCC_EXECUTABLE%/bin/nvcc}
+[ -d "$__jetson_nvcc_home/include" ] || __jetson_nvcc_home=$CUDA_TOOLKIT_ROOT
+CUDAFLAGS="-I$__jetson_nvcc_home/include -L$CUDA_TOOLKIT_ROOT/targets/aarch64-linux/lib"
+export CUDAFLAGS
+unset __jetson_nvcc_home
+
 export PKG_CONFIG_SYSROOT_DIR="$JETSON_ROOTFS"
 export PKG_CONFIG_LIBDIR="$JETSON_ROOTFS/usr/lib/aarch64-linux-gnu/pkgconfig:$JETSON_ROOTFS/usr/lib/pkgconfig:$JETSON_ROOTFS/usr/share/pkgconfig:$JETSON_ROOTFS/usr/local/lib/aarch64-linux-gnu/pkgconfig:$JETSON_ROOTFS/usr/local/lib/pkgconfig"
 unset PKG_CONFIG_PATH

@@ -15,6 +15,15 @@ set(CMAKE_CUDA_ARCHIVE_FINISH "<CMAKE_RANLIB> <TARGET>")
 # Debian multiarch keeps libc headers in <sysroot>/usr/include/aarch64-linux-gnu.
 # CMAKE_SYSROOT alone only adds <sysroot>/usr/include, so a plain #include
 # <math.h> would fail on bits/wordsize.h without this.
+#
+# COMPILE-SIDE --sysroot DISCIPLINE: do NOT add --sysroot=<rootfs> to
+# CMAKE_C_FLAGS_INIT / CMAKE_CXX_FLAGS_INIT. The buildroot gcc's multilib
+# directory is named aarch64-buildroot-linux-gnu while Ubuntu rootfs uses
+# aarch64-linux-gnu; a second --sysroot on the compile side makes
+# gnu/stubs.h and bits/libc-header-start.h unresolvable. Compile headers
+# come from the toolchain's own glibc (2.34), link libraries from the
+# rootfs glibc (2.35) -- header <= library is forward compatible and
+# safe. --sysroot belongs ONLY in the link flags above.
 set(CMAKE_C_FLAGS_INIT "-isystem\ ${CMAKE_SYSROOT}/usr/include/aarch64-linux-gnu@CUDNN_INCLUDE_FLAG@")
 set(CMAKE_CXX_FLAGS_INIT "-isystem\ ${CMAKE_SYSROOT}/usr/include/aarch64-linux-gnu@CUDNN_INCLUDE_FLAG@")
 set(CMAKE_CUDA_FLAGS_INIT "-isystem\ ${CMAKE_SYSROOT}/usr/include/aarch64-linux-gnu@CUDNN_INCLUDE_FLAG@")
@@ -56,4 +65,33 @@ set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -isystem ${CMAKE_CUDA_INCLUDE_DIR}
 set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -isystem ${CMAKE_CUDA_INCLUDE_DIR}")
 set(CMAKE_CUDA_FLAGS_INIT "${CMAKE_CUDA_FLAGS_INIT} -isystem ${CMAKE_CUDA_INCLUDE_DIR}")
 list(APPEND CMAKE_INCLUDE_PATH "${CMAKE_CUDA_INCLUDE_DIR}")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-B${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/ -L${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu -L${CMAKE_CUDA_TARGET_LIB_DIR}@CUDNN_LIB_FLAG@ -Wl,-rpath-link,${CMAKE_SYSROOT}/lib/aarch64-linux-gnu -Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/tegra -Wl,-rpath-link,${CMAKE_CUDA_TARGET_LIB_DIR}")
+# Linker flags shared by every link type. Ubuntu's libc.so is a linker
+# SCRIPT with absolute paths baked in (/lib/aarch64-linux-gnu/libc.so.6,
+# /usr/lib/aarch64-linux-gnu/libc_nonshared.a, /lib/ld-linux-aarch64.so.1);
+# only --sysroot relocates those into the sysroot. Without it a SHARED
+# link dies with `ld: cannot find /lib/aarch64-linux-gnu/libc.so.6`.
+#
+# -B<multiarch> is NOT optional: with --sysroot active, ld looks for
+# Scrt1.o / crti.o under the buildroot triple directory
+# (aarch64-buildroot-linux-gnu), not Ubuntu's aarch64-linux-gnu, so the
+# startup objects must be pointed at explicitly.
+#
+# The rpath-link list must cover Ubuntu's subdirectory layout:
+# blas/ and lapack/ are needed by OpenCV's armadillo dependency chain
+# (NEEDED libblas.so.3 / liblapack.so.3 live there), nvidia/ holds the
+# NVIDIA userspace libs, and tegra/ the Tegra-specific ones. Missing any
+# of these surfaces as `undefined reference to cgbtrs_/sposvx_/...`.
+set(_JETSON_LINK_FLAGS "-B${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/ --sysroot=${CMAKE_SYSROOT} -L${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu -L${CMAKE_CUDA_TARGET_LIB_DIR}@CUDNN_LIB_FLAG@ -Wl,-rpath-link,${CMAKE_SYSROOT}/lib/aarch64-linux-gnu -Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/lapack -Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/blas -Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/nvidia -Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/tegra -Wl,-rpath-link,${CMAKE_CUDA_TARGET_LIB_DIR}")
+set(CMAKE_EXE_LINKER_FLAGS_INIT    "${_JETSON_LINK_FLAGS}")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "${_JETSON_LINK_FLAGS}")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT "${_JETSON_LINK_FLAGS}")
+
+# OpenCV installs its CMake package config into the Debian multiarch
+# directory (usr/lib/aarch64-linux-gnu/cmake/opencv4). Under a buildroot
+# toolchain CMake's find_package does not search that path -- the toolchain
+# multilib directory is named aarch64-buildroot-linux-gnu -- so
+# find_package(OpenCV 4 REQUIRED) fails even though the config file is
+# right there in the sysroot. Point it at the right place when present.
+if(EXISTS "${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/cmake/opencv4")
+  set(OpenCV_DIR "${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/cmake/opencv4" CACHE PATH "")
+endif()

@@ -162,6 +162,22 @@ See `lib/jetson-versions.sh` for the full table. JetPack 5.0 through
 6.2.3 are covered, with L4T 35.1.0 through 36.5.2. JetPack 7 / L4T 38
 are not supported by the L4T 35/36 toolchain mapping.
 
+## Host CUDA toolkit version
+
+The SDK's rootfs ships the CUDA release that matches the target JetPack
+(JetPack 6.1 → CUDA 12.6). The build host's CUDA toolkit may be a
+different release. The split is:
+
+| Side | Where it comes from | Why |
+|---|---|---|
+| Headers | host toolkit `include/` (from `cuda-crt-cross-aarch64`, includes `crt/`) | arch independent; host's copy is complete |
+| Libraries | rootfs `targets/aarch64-linux/lib` | must be aarch64 and match the device CUDA runtime |
+
+"Host 12.9 headers + rootfs 12.6 libraries" works in practice (nvcc
+matches its own headers strictly, libraries match the device runtime
+strictly), but aligning the host toolkit with the rootfs CUDA release
+removes the doubt. See `templates/usage-guide.md` §5.1.
+
 ## License
 
 This repository is internal tooling for building cross-compilation SDKs

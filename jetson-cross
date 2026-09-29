@@ -197,7 +197,7 @@ build_linux_x86_online() {
   normalize_sysroot_symlinks "$sdk/sysroot"
   generate_activate_sh "$sdk" "sysroot" \
     "toolchain/${BOOTLIN_TOOLCHAIN_NAME}/bin/aarch64-buildroot-linux-gnu-" \
-    "$nvcc" "" "${JETPACK_VERSION:-}" "$L4T_VERSION"
+    "$nvcc" "" "${JETPACK_VERSION:-}" "$L4T_VERSION" "$cuda_version"
   generate_toolchain_cmake "$sdk" "usr/include" "usr/lib/aarch64-linux-gnu"
   copy_example_project "$sdk"
   ( source "$sdk/activate.sh"
@@ -249,6 +249,12 @@ build_offline_linux() {
   install_rootfs_dev_stack "$root" "$cuda_suffix"
   unmount_chroot_filesystems "$root"
   trap - EXIT
+  # The CUDA packages leave /usr/local/cuda pointing into /etc/alternatives.
+  # Those absolute links resolve against the HOST root, so on a host with
+  # its own CUDA toolkit the sysroot silently picks up x86_64 libs. Rewrite
+  # them to the versioned toolkit directory inside the rootfs before the
+  # generic symlink normalizer runs.
+  fix_cuda_alternatives "$root" "$cuda_version"
   normalize_sysroot_symlinks "$root" "$sdk/escaping-symlinks.txt"
   # Toolchain choice: Bootlin on x86_64, native gcc on aarch64.
   local cross_rel nvcc wrapper_rel
@@ -290,7 +296,7 @@ build_offline_linux() {
   esac
   generate_activate_sh "$sdk" "Linux_for_Tegra/rootfs" \
     "$activate_cross_rel" "$activate_nvcc_rel" "$wrapper_rel" \
-    "${JETPACK_VERSION:-}" "$l4t"
+    "${JETPACK_VERSION:-}" "$l4t" "$cuda_version"
   generate_toolchain_cmake "$sdk" "$CUDNN_INCLUDE_DIR" "$CUDNN_LIB_DIR"
   copy_example_project "$sdk"
   local cross_prefix
@@ -324,7 +330,7 @@ build_on_jetson() {
   generate_nvcc_wrapper "$sdk" "$cuda_version"
   probe_cudnn "$sdk/sysroot" || true
   generate_activate_sh "$sdk" "sysroot" "" "/usr/local/cuda/bin/nvcc" "bin/nvcc" \
-    "${JETPACK_VERSION:-}" "$L4T_VERSION"
+    "${JETPACK_VERSION:-}" "$L4T_VERSION" "$cuda_version"
   generate_toolchain_cmake "$sdk" "$CUDNN_INCLUDE_DIR" "$CUDNN_LIB_DIR"
   copy_example_project "$sdk"
   ship_usage_guide "$sdk"
