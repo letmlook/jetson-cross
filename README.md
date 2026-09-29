@@ -1,92 +1,169 @@
-# Jetson ARM64 build environment
+# jetson-cross
 
-The setup scripts accept either a JetPack version or its L4T version. The
-default is JetPack 6.1 (L4T 36.4.0).
+A single entry point to build, package, and use a Jetson ARM64
+cross-compilation SDK on any host. The repository is fully modular:
+shared logic lives in `lib/`, generated files come from `templates/`,
+and Docker base images live in `docker/`.
 
-## Documentation
+## Features
 
-- **[使用说明.md](docs/使用说明.md)** — how to use the generated SDK: activation,
-  exported variables, CMake/Make/g++ invocations, CUDA, sysroot symlink
-  behaviour, deployment to a Jetson, and troubleshooting.
+- **One script for every host.** `jetson-cross` dispatches by platform
+  and mode. Pick `--platform=linux-x86 --mode=direct` to build natively
+  on an x86_64 Linux box, `--mode=docker` to do the same build inside a
+  container, `--platform=linux-arm64` for an aarch64 Linux host,
+  `--platform=macos-arm64` for Apple Silicon (always Docker), or
+  `--platform=jetson` to build on the device itself.
+- **Three sysroot sources.** `online` rsyncs from a real Jetson device
+  you SSH into, `bsp` downloads the NVIDIA Jetson Linux BSP + Sample
+  RootFS and runs `apply_binaries.sh` against them, `on-target` uses
+  the Jetson's own filesystem (when `--platform=jetson`).
+- **Self-contained SDK.** Every SDK ships with `activate.sh`,
+  `toolchain.cmake`, an example CUDA project, and a standalone
+  `使用说明.md`. Move it, copy it, archive it — `activate.sh` derives
+  every path from its own location.
+- **Pre-generated usage guide.** `templates/usage-guide.md` is the
+  single source of truth. `jetson-cross usage-guide` can emit it into
+  any SDK on demand, with no build context required.
+- **No version pinning inside the rootfs.** The Jetson repository
+  publishes one build of every package per L4T release, so packages
+  are installed by name only. JetPack closure walking, `--allow-downgrades`,
+  and exact `=version` constraints are gone.
 
-## Apple Silicon
+## Repository layout
 
-Docker Desktop is required. Initialization runs in a native `linux/arm64`
-Ubuntu container, so it does not emulate an x86 CPU. The generated programs
-target Jetson Linux and must be run on a Jetson device.
-
-Initialize or update the persistent SDK volume:
-
-```bash
-./setup-jetson-cross-sdk-macos-arm64.sh init
-./setup-jetson-cross-sdk-macos-arm64.sh init 6.2.1
-./setup-jetson-cross-sdk-macos-arm64.sh init 36.4.4
+```
+jetson-cross               unified entry point
+lib/                       modular bash libraries
+  common.sh                logging, ERR trap, helpers
+  host-detect.sh           arch / OS / Jetson / L4T mapping
+  privilege.sh             sudo shim for root containers
+  jetson-versions.sh       JetPack ↔ L4T table
+  toolchain.sh             Bootlin or native aarch64 GCC
+  nvcc.sh                  host CUDA install and locate
+  sysroot-rsync.sh         online sysroot acquisition
+  sysroot-offline.sh       BSP + sample-rootfs extract
+  sysroot-shared.sh        normalize absolute symlinks, slim
+  rootfs-apt.sh            rootfs apt + cuDNN probe
+  on-target.sh             Jetson-as-build-host
+  sdk-skeleton.sh          activate.sh / toolchain.cmake / smoke
+  sdk-package.sh           tar.zst packaging
+  docker-{base,volumes,run}.sh
+  docs.sh                  usage guide renderer
+templates/
+  activate.sh.tmpl         activation script template
+  toolchain.cmake.tmpl     CMake toolchain template
+  nvcc-wrapper.sh.tmpl     nvcc wrapper (fixed: no stray fi / exec)
+  usage-guide.md           SDK-internal usage guide
+  example-cuda-smoke/      CUDA smoke project
+docker/
+  macos-arm64/             Apple Silicon base image
+  linux/                   Linux (x86_64 + arm64) base image
+example-cuda-smoke/        reference project (mirror of templates/...)
+tests/                     modular test suite
+docs/使用说明.md           this repository's developer doc
 ```
 
-Equivalent JetPack and L4T inputs share one volume. For example, `6.2.1` and
-`36.4.4` both use
-`jetson-cross-sdk-jp6.2.1-l4t36.4.4-arm64`.
+## Quick start
 
-Open a build shell or run one command using the mutable volume:
+### Build an SDK on any supported host
 
 ```bash
-./setup-jetson-cross-sdk-macos-arm64.sh shell
-./setup-jetson-cross-sdk-macos-arm64.sh run cmake --build /workspace/build
+# Linux x86_64: build directly, rsync sysroot from a Jetson
+jetson-cross build --platform=linux-x86 --source=online \
+    --jetson=user@jetson --cuda=12.6
+
+# Linux x86_64: build directly, download BSP + rootfs
+jetson-cross build --platform=linux-x86 --source=bsp
+
+# Linux aarch64: build directly (native cross-compile)
+jetson-cross build --platform=linux-arm64
+
+# Linux x86_64 / aarch64: build inside Docker
+jetson-cross build --platform=linux-x86 --mode=docker
+
+# Apple Silicon: always Docker
+jetson-cross build
+
+# On the Jetson device itself
+jetson-cross build --platform=jetson
 ```
 
-Package a successfully initialized volume into a `tar.zst` archive you can
-move between machines, then restore it:
+The build resolves a default JetPack version of **6.1** when none is
+given. Override with `--version=6.2.1` or `--version=36.4.4` (any
+JetPack or L4T alias from `lib/jetson-versions.sh`).
+
+### Use the SDK
 
 ```bash
-./setup-jetson-cross-sdk-macos-arm64.sh archive 6.2.1
-./setup-jetson-cross-sdk-macos-arm64.sh archive 6.2.1 /path/to/sdk.tar.zst
-
-./setup-jetson-cross-sdk-macos-arm64.sh restore 6.2.1 /path/to/sdk.tar.zst
+source /path/to/sdk/activate.sh
+cmake -S ~/my-project -B ~/my-project/build -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE=/path/to/sdk/toolchain.cmake
+cmake --build ~/my-project/build
 ```
 
-The default output name is
-`jetson-cross-sdk-jp6.2.1-l4t36.4.4-arm64.tar.zst`, matching the volume name.
-Archives use zstd, which is markedly smaller than gzip at a similar speed; on a
-JetPack 6.1 SDK it is roughly 5.8 GB against 7.8 GB. Extract with
-`tar --zstd -xf`. Creating an archive does not remove or modify the source
-volume, and restoring one extracts into the volume of the resolved version.
-Only initialization uses a privileged container; archiving, restoring, build
-shells and commands are all unprivileged.
+See `docs/使用说明.md` for full activation, deployment, and
+troubleshooting notes; the same document is shipped inside each SDK
+as `使用说明.md`.
 
-Set `JETSON_PROJECT_DIR` to mount a source directory other than the current
-directory at `/workspace`.
-
-## Linux setup scripts
-
-The offline script defaults to JetPack 6.1 and accepts either version family:
+### Package and distribute
 
 ```bash
-./setup-jetson-cross-sdk-offline.sh
-./setup-jetson-cross-sdk-offline.sh 6.2.1
-./setup-jetson-cross-sdk-offline.sh 36.4.4
+# Package an SDK directory into a portable tar.zst archive
+jetson-cross archive --sdk-dir=~/my-jetson-sdk
+
+# Re-emit just the usage guide into an existing SDK
+jetson-cross usage-guide --sdk-dir=~/my-jetson-sdk
 ```
 
-A successful build is packaged automatically into `<sdk-dir>.tar.zst` next to
-the SDK directory (zstd, matching the macOS archive flow; gzip is the
-fallback where zstd is unavailable), and only replaces a previous archive
-after its contents verify. Pass `--no-package` (in any position) to skip
-packaging:
+### Open a build shell or run a single command
 
 ```bash
-./setup-jetson-cross-sdk-offline.sh 6.1 --no-package
+# Direct (Linux): open a subshell with the SDK activated
+jetson-cross shell --sdk-dir=~/my-jetson-sdk
+
+# Docker (macOS / Linux): open a container with the SDK activated
+jetson-cross shell --mode=docker
+
+# Run a single command
+jetson-cross run -- cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=...
 ```
 
-On an AArch64 Ubuntu host it uses native GCC, binutils, and CUDA compiler
-packages. On x86_64 Ubuntu it retains the Bootlin cross compiler and QEMU
-rootfs setup.
+## Environment variables
 
-The online script also accepts either version family. Omitting the version
-selects JetPack 6.1:
+| Variable | Purpose |
+|---|---|
+| `JETSON_OS_RELEASE_FILE` | Override the path to `/etc/os-release` (testing only) |
+| `JETSON_PROJECT_DIR` | Mounted as `/workspace` inside Docker shells/runs |
+| `JETSON_CROSS_BASE_IMAGE` | Override the Docker base image tag |
+| `JETSON_NVCC` | Source-time override for the SDK's `CUDACXX` |
+| `JETSON_DOCKER_BUILD_PROXY` | HTTP proxy forwarded to `docker build` |
+| `JETSON_CROSS_DEBUG` | Echo every `run` command before executing |
+
+## Tests
 
 ```bash
-./setup-jetson-cross-sdk.sh user@jetson 12.6
-./setup-jetson-cross-sdk.sh user@jetson 6.2.1 12.6
-./setup-jetson-cross-sdk.sh user@jetson 36.4.4 12.6
+for t in tests/*.test.sh; do bash "$t"; done
 ```
 
-JetPack 7/L4T 38 and newer are not supported by the current L4T 35/36 setup.
+The test suite covers:
+
+- `version-resolution` — JetPack/L4T slug resolution
+- `cli` — argument parsing, dispatch, and platform auto-detection
+- `templates-render` — every template renders to a valid file
+- `sysroot-shared` — absolute-symlink rewriting + slim
+- `rootfs-apt` — package installation by name, cuDNN probe
+- `on-target-detect` — Jetson detection, mode resolution, L4T mapping
+- `docker-run` — Docker volume naming, image tags, proxy args
+- `sdk-skeleton` — full SDK skeleton generation + relocatability
+
+## Supported JetPack / L4T releases
+
+See `lib/jetson-versions.sh` for the full table. JetPack 5.0 through
+6.2.3 are covered, with L4T 35.1.0 through 36.5.2. JetPack 7 / L4T 38
+are not supported by the L4T 35/36 toolchain mapping.
+
+## License
+
+This repository is internal tooling for building cross-compilation SDKs
+against NVIDIA's published Jetson images. See NVIDIA's developer site
+for the underlying BSP, Sample RootFS, and JetPack component licenses.

@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# jetson-cross: unified entry point for building, packaging, and using
+# the Jetson ARM64 cross-compilation SDK.
+#
+# Usage:
+#   jetson-cross build    [options]   Build the SDK
+#   jetson-cross archive  [options]   Package a finished SDK into tar.zst
+#   jetson-cross restore  [options]   Restore an archive into an SDK dir or Docker volume
+#   jetson-cross shell    [options]   Open an interactive shell inside the SDK environment
+#   jetson-cross run      [options] -- CMD [ARGS...]
+#                                    Run a single command inside the SDK environment
+#   jetson-cross usage-guide [--sdk-dir=DIR] [--out=PATH]
+#                                    Render the SDK usage guide
+#   jetson-cross help                  Show this help
+#
+# Run `jetson-cross <action> --help` for action-specific options.
+
+set -Eeuo pipefail
+
+# Locate the lib/ directory relative to this script. Works whether the
+# script is on PATH or run by absolute path.
+JETSON_CROSS_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+JETSON_CROSS_LIB_DIR="$JETSON_CROSS_REPO_ROOT/lib"
+
+# Source every module. Order matters: common.sh first; host-detect.sh
+# before anything that calls uname(); privilege.sh before any module that
+# needs sudo.
+for _mod in common.sh host-detect.sh privilege.sh \
+            jetson-versions.sh toolchain.sh nvcc.sh \
+            sysroot-shared.sh sysroot-rsync.sh sysroot-offline.sh \
+            rootfs-apt.sh on-target.sh sdk-skeleton.sh sdk-package.sh \
+            docker-base.sh docker-volumes.sh docker-run.sh docs.sh; do
+  # shellcheck source=lib/$_mod
+  source "$JETSON_CROSS_LIB_DIR/$_mod"
+done
+unset _mod
+
+# ----------------------------------------------------------------------------
+# Action dispatch
+# ----------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+jetson-cross: Jetson ARM64 cross-compilation SDK builder
+
+Usage:
+  jetson-cross build    [options]
+  jetson-cross archive  [options]
+  jetson-cross restore  [options]
+  jetson-cross shell    [options]
+  jetson-cross run      [options] -- CMD [ARGS...]
+  jetson-cross usage-guide [options]
+  jetson-cross help
+
+Common options:
+  --platform=auto|linux-x86|linux-arm64|macos-arm64|jetson
+  --mode=auto|direct|docker
+  --source=auto|online|bsp      (build only)
+  --version=VER                 JetPack or L4T version (default: 6.1)
+  --sdk-dir=DIR                 Where to put the SDK
+  --jetson=USER@HOST            (build --source=online)
+  --bsp=PATH --rootfs=PATH      (build --source=bsp; offline/local archives)
+  --cuda=VER                    (build --source=online)
+  --no-package                  Skip post-build archive step
+  --no-slim                     Skip SDK slimming step
+EOF
+}
+
+die_usage() { printf 'ERROR: %s\n\n' "$*" >&2; usage >&2; exit 2; }
+
+# Parse --key=value or --key value style options into a single associative
+# array of names → values.
+parse_opts() {
+  OPT_PLATFORM=auto
+  OPT_MODE=auto
+  OPT_SOURCE=auto
+  OPT_VERSION=
+  OPT_SDK_DIR=
+  OPT_SDK_DIR_USER=0
+  OPT_JETSON=
+  OPT_BSP=
+  OPT_ROOTFS=
+  OPT_CUDA=
+  OPT_NO_PACKAGE=0
+  OPT_NO_SLIM=0
+  OPT_OUT=
+  while (( $# > 0 )); do
+    case $1 in
+      --platform=*)   OPT_PLATFORM=${1#*=} ;;
+      --mode=*)       OPT_MODE=${1#*=} ;;
+      --source=*)     OPT_SOURCE=${1#*=} ;;
+      --version=*)    OPT_VERSION=${1#*=} ;;
+      --sdk-dir=*)    OPT_SDK_DIR=${1#*=} ; OPT_SDK_DIR_USER=1 ;;
+      --jetson=*)     OPT_JETSON=${1#*=} ;;
+      --bsp=*)        OPT_BSP=${1#*=} ;;
+      --rootfs=*)     OPT_ROOTFS=${1#*=} ;;
+      --cuda=*)       OPT_CUDA=${1#*=} ;;
+      --no-package)   OPT_NO_PACKAGE=1 ;;
+      --no-slim)      OPT_NO_SLIM=1 ;;
+      --out=*)        OPT_OUT=${1#*=} ;;
+      --out)          OPT_OUT=$2; shift ;;
+      --help|-h)      ACTION_HELP=1 ;;
+      *)              die_usage "unknown option: $1" ;;
+    esac
+    shift
+  done
+}
+
+resolve_opts() {
+  # Platform
+  if [[ $OPT_PLATFORM = auto ]]; then
+    OPT_PLATFORM=$(default_platform)
+  fi
+  case $OPT_PLATFORM in
+    linux-x86|linux-arm64|macos-arm64|jetson) ;;
+    *) die "unknown --platform: $OPT_PLATFORM" ;;
+  esac
+  # Mode
+  if [[ $OPT_MODE = auto ]]; then
+    OPT_MODE=$(default_mode_for_platform "$OPT_PLATFORM")
+  fi
+  case $OPT_MODE in
+    direct|docker) ;;
+    *) die "unknown --mode: $OPT_MODE" ;;
+  esac
+  # Source
+  if [[ $OPT_SOURCE = auto ]]; then
+    case $OPT_PLATFORM in
+      macos-arm64|jetson|linux-arm64) OPT_SOURCE=bsp ;;
+      linux-x86)                      OPT_SOURCE=online ;;
+    esac
+  fi
+  case $OPT_SOURCE in
+    online|bsp) ;;
+    *) die "unknown --source: $OPT_SOURCE" ;;
+  esac
+  # Version (apply default late so the resolved slug is available)
+  [[ -n $OPT_VERSION ]] || OPT_VERSION=$DEFAULT_JETPACK_VERSION
+  resolve_jetson_version "$OPT_VERSION" \
+    || die "unsupported JetPack/L4T version: $OPT_VERSION"
+  if [[ -n $JETPACK_VERSION ]]; then
+    log "Resolved JetPack $JETPACK_VERSION to L4T $L4T_VERSION"
+  else
+    log "Using L4T $L4T_VERSION (no known JetPack mapping)"
+  fi
+  # Default SDK dir
+  if [[ -z $OPT_SDK_DIR ]]; then
+    if [[ $OPT_MODE = docker ]]; then
+      OPT_SDK_DIR=$JETSON_VERSION_SLUG
+    else
+      OPT_SDK_DIR="jetson-cross-sdk-$JETSON_VERSION_SLUG"
+    fi
+  fi
+  if [[ $OPT_SDK_DIR != /* && $OPT_MODE != docker ]]; then
+    OPT_SDK_DIR="$PWD/$OPT_SDK_DIR"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# build action
+# ----------------------------------------------------------------------------
+
+# Linux-x86 build (online source: rsync sysroot from a Jetson device).
+build_linux_x86_online() {
+  [[ -n $OPT_JETSON ]] || die "--jetson=USER@HOST is required for --platform=linux-x86 --source=online"
+  [[ -n $OPT_CUDA ]]   || die "--cuda=MAJOR.MINOR is required for --platform=linux-x86 --source=online"
+  install_err_trap "SDK"
+  init_sudo
+  detect_os_release
+  [[ $ID = ubuntu && ( $VERSION_ID = 20.04 || $VERSION_ID = 22.04 ) ]] \
+    || die 'Supported host: Ubuntu 20.04 or 22.04 x86_64'
+  local sdk=$OPT_SDK_DIR cuda_pkg cuda_version repo major minor
+  cuda_pkg=${OPT_CUDA/./-}
+  cuda_version=$OPT_CUDA
+  major=${L4T_VERSION%%.*}; minor=$(printf '%s' "$L4T_VERSION" | cut -d. -f2)
+  repo="r${major}.${minor}"
+  log "Target L4T=$L4T_VERSION CUDA=$cuda_version; host repo=$repo"
+  probe_target "$OPT_JETSON" "$L4T_VERSION" "$cuda_version"
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates curl gnupg rsync openssh-client cmake ninja-build \
+    pkg-config file python3 binutils-aarch64-linux-gnu
+  add_jetson_apt_source_x86_64 "$VERSION_CODENAME" "$repo"
+  for pkg in "cuda-nvcc-$cuda_pkg" "cuda-cross-aarch64-$cuda_pkg"; do
+    apt-cache show "$pkg" 2>/dev/null | grep -q '^Package:' \
+      || die "$pkg unavailable in $repo for $VERSION_CODENAME"
+  done
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    "cuda-nvcc-$cuda_pkg" "cuda-cross-aarch64-$cuda_pkg"
+  local nvcc="/usr/local/cuda-${cuda_version}/bin/nvcc"
+  [[ -x $nvcc ]] || die "Host nvcc missing: $nvcc"
+  mkdir -p "$sdk/toolchain" "$sdk/sysroot" "$sdk/example"
+  toolchain_for_target "$L4T_VERSION"
+  download_bootlin_toolchain "$sdk"
+  rsync_sysroot "$OPT_JETSON" "$sdk"
+  slim_sdk_rsourced "$sdk/sysroot"
+  normalize_sysroot_symlinks "$sdk/sysroot"
+  generate_activate_sh "$sdk" "sysroot" \
+    "toolchain/${BOOTLIN_TOOLCHAIN_NAME}/bin/aarch64-buildroot-linux-gnu-" \
+    "$nvcc" "" "${JETPACK_VERSION:-}" "$L4T_VERSION"
+  generate_toolchain_cmake "$sdk" "usr/include" "usr/lib/aarch64-linux-gnu"
+  copy_example_project "$sdk"
+  ( source "$sdk/activate.sh"
+    pkg-config --modversion opencv4 gstreamer-1.0 libavformat >/dev/null
+    cmake -S "$sdk/example-cuda-smoke" -B "$sdk/example-cuda-smoke/build" -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE="$sdk/toolchain.cmake" -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$sdk/example-cuda-smoke/build"
+    file "$sdk/example-cuda-smoke/build/jp61_cuda_smoke"
+    "${BOOTLIN_TOOLCHAIN_NAME:+${sdk}/toolchain/${BOOTLIN_TOOLCHAIN_NAME}/bin/aarch64-buildroot-linux-gnu-}readelf" -h "$sdk/example-cuda-smoke/build/jp61_cuda_smoke" \
+      | grep -q 'Machine:.*AArch64' || die 'verification failed'
+  )
+  ship_usage_guide "$sdk"
+  : > "$sdk/.setup-complete"
+  log "SDK ready: source '$sdk/activate.sh'"
+}
+
+# Build the offline flow on a Linux host (x86_64 or native arm64). Used
+# both by --mode=direct and by --mode=docker (the container runs the
+# same offline flow).
+build_offline_linux() {
+  install_err_trap "SDK"
+  init_sudo
+  detect_os_release
+  local host_arch
+  host_arch=$(detect_arch)
+  if [[ $host_arch != x86_64 && $host_arch != aarch64 ]]; then
+    die "unsupported host architecture: $host_arch"
+  fi
+  [[ $ID = ubuntu && ( $VERSION_ID = 20.04 || $VERSION_ID = 22.04 ) ]] \
+    || die 'supported hosts: Ubuntu 20.04 or 22.04 on x86_64 or aarch64'
+  local sdk=$OPT_SDK_DIR
+  local l4t=$L4T_VERSION major minor repo cuda_suffix cuda_version
+  major=${l4t%%.*}; minor=$(printf '%s' "$l4t" | cut -d. -f2)
+  repo="r${major}.${minor}"
+  install_host_prereqs_offline
+  if ! is_native_arm64; then enable_binfmt_aarch64; fi
+  mkdir -p "$sdk/downloads" "$sdk/toolchain"
+  : >| "$sdk/.setup-complete"
+  download_bsp_and_rootfs "$sdk" "$l4t" "$OPT_BSP" "$OPT_ROOTFS"
+  extract_bsp_and_rootfs "$sdk" "$BSP_TARBALL" "$ROOTFS_TARBALL"
+  local root="$sdk/Linux_for_Tegra/rootfs"
+  [[ -d $root/usr ]] || die 'Rootfs incomplete'
+  mount_chroot_filesystems "$root"
+  # Always remove the EXIT trap before we explicitly call cleanup below.
+  trap 'unmount_chroot_filesystems "$root"' EXIT
+  cuda_suffix=$(resolve_cuda_suffix_in_rootfs "$root")
+  cuda_version=$(cuda_suffix_to_version "$cuda_suffix")
+  add_jetson_apt_source_rootfs "$root" "$repo"
+  install_rootfs_dev_stack "$root" "$cuda_suffix"
+  unmount_chroot_filesystems "$root"
+  trap - EXIT
+  normalize_sysroot_symlinks "$root" "$sdk/escaping-symlinks.txt"
+  # Toolchain choice: Bootlin on x86_64, native gcc on aarch64.
+  local cross_rel nvcc wrapper_rel
+  if is_native_arm64; then
+    assert_native_arm64_compiler
+    cross_rel=
+    nvcc="$root/usr/local/cuda-${cuda_version}/bin/nvcc"
+    [[ -x $nvcc ]] || nvcc="$root/usr/local/cuda/bin/nvcc"
+    [[ -x $nvcc ]] || die "rootfs nvcc missing"
+    wrapper_rel="bin/nvcc"
+  else
+    toolchain_for_target "$l4t"
+    download_bootlin_toolchain "$sdk"
+    cross_rel="toolchain/${BOOTLIN_TOOLCHAIN_NAME}/bin/aarch64-buildroot-linux-gnu-"
+    nvcc=$(locate_host_nvcc "$cuda_version")
+    if [[ -z $nvcc ]]; then
+      log "Installing host nvcc for CUDA $cuda_version"
+      install_host_nvcc "$cuda_suffix" "$VERSION_CODENAME" "$repo"
+      nvcc=$(locate_host_nvcc "$cuda_version")
+    fi
+    [[ -x $nvcc ]] || die "host nvcc missing for CUDA $cuda_version"
+    wrapper_rel="bin/nvcc"
+  fi
+  # nvcc wrapper + CUDA host-include
+  build_cuda_host_include_symlinks "$sdk" "$root"
+  generate_nvcc_wrapper "$sdk" "$cuda_version"
+  # Probe cuDNN before generating toolchain.cmake (the file embeds the dirs)
+  probe_cudnn "$root"
+  pkg_config_smoke_test "$root"
+  # Activate / toolchain / smoke
+  if [[ -n $cross_rel ]]; then
+    activate_cross_rel=$cross_rel
+  else
+    activate_cross_rel=
+  fi
+  case $nvcc in
+    "$sdk"/*) activate_nvcc_rel=${nvcc#"$sdk"/} ;;
+    *)        activate_nvcc_rel=$nvcc ;;
+  esac
+  generate_activate_sh "$sdk" "Linux_for_Tegra/rootfs" \
+    "$activate_cross_rel" "$activate_nvcc_rel" "$wrapper_rel" \
+    "${JETPACK_VERSION:-}" "$l4t"
+  generate_toolchain_cmake "$sdk" "$CUDNN_INCLUDE_DIR" "$CUDNN_LIB_DIR"
+  copy_example_project "$sdk"
+  local cross_prefix
+  cross_prefix=$(cross_prefix_for_sdk "$sdk")
+  run_offline_smoke_tests "$sdk" "$root" "$cross_prefix"
+  if (( ! OPT_NO_SLIM )); then slim_sdk "$sdk" "$root"; fi
+  ship_usage_guide "$sdk"
+  : > "$sdk/.setup-complete"
+  log "SDK ready: source '$sdk/activate.sh'"
+  if (( ! OPT_NO_PACKAGE )); then package_sdk "$sdk"; fi
+}
+
+# Build on the Jetson device itself: the device's own filesystem is the
+# rootfs, no BSP download, no chroot.
+build_on_jetson() {
+  install_err_trap "SDK"
+  init_sudo
+  detect_os_release
+  assert_jetson_toolchain
+  local sdk=$OPT_SDK_DIR
+  mkdir -p "$sdk"
+  build_on_target "$sdk"
+  slim_sdk_rsourced "$sdk/sysroot"
+  normalize_sysroot_symlinks "$sdk/sysroot"
+  local cuda_version
+  cuda_version=$(locate_host_nvcc "" >/dev/null 2>&1; printf '%s')
+  if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+    cuda_version=$(/usr/local/cuda/bin/nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
+  fi
+  [[ -n $cuda_version ]] || cuda_version=12.6
+  generate_nvcc_wrapper "$sdk" "$cuda_version"
+  probe_cudnn "$sdk/sysroot" || true
+  generate_activate_sh "$sdk" "sysroot" "" "/usr/local/cuda/bin/nvcc" "bin/nvcc" \
+    "${JETPACK_VERSION:-}" "$L4T_VERSION"
+  generate_toolchain_cmake "$sdk" "$CUDNN_INCLUDE_DIR" "$CUDNN_LIB_DIR"
+  copy_example_project "$sdk"
+  ship_usage_guide "$sdk"
+  : > "$sdk/.setup-complete"
+  log "SDK ready: source '$sdk/activate.sh'"
+}
+
+# ----------------------------------------------------------------------------
+# Docker dispatcher: launch the offline flow inside a Linux/arm64 container
+# ----------------------------------------------------------------------------
+
+build_via_docker() {
+  docker_proxy_settings
+  local ubuntu_version
+  ubuntu_version=$(ubuntu_version_for_l4t "$L4T_VERSION")
+  ensure_base_image linux "$ubuntu_version"
+  local volume
+  volume=$(default_volume_name "$JETSON_VERSION_SLUG")
+  ensure_volume "$volume"
+  local base_image
+  base_image=$(default_base_image_tag linux "$ubuntu_version")
+  # Map the SDK dir to /opt/jetson-sdk inside the container. For direct
+  # builds the user passes a host path; for docker builds we keep the
+  # SDK in a volume and let the user pull files out via archive/restore.
+  local map_args=(-v "$volume:/opt/jetson-sdk"
+                  -v "$JETSON_CROSS_REPO_ROOT:/opt/jetson-cross:ro")
+  # Stage 1: run the offline flow inside the container (privileged) so
+  # chroot + mount work. The flow writes its outputs into the volume.
+  local -a init_args=(--rm --platform linux/arm64 --privileged
+                     "${proxy_run_args[@]}" "${map_args[@]}"
+                     "$base_image"
+                     /opt/jetson-cross/jetson-cross build
+                       --platform=linux-x86
+                       --mode=direct
+                       --source=bsp
+                       --version="$L4T_VERSION"
+                       --sdk-dir=/opt/jetson-sdk)
+  [[ -n $OPT_BSP    ]] && init_args+=(--bsp="$OPT_BSP")
+  [[ -n $OPT_ROOTFS ]] && init_args+=(--rootfs="$OPT_ROOTFS")
+  if (( OPT_NO_PACKAGE )); then init_args+=(--no-package); fi
+  docker run "${init_args[@]}"
+  echo "SDK ready in Docker volume: $volume"
+  echo "Run 'jetson-cross archive' to package it for the host."
+}
+
+# ----------------------------------------------------------------------------
+# archive / restore / shell / run actions
+# ----------------------------------------------------------------------------
+
+do_archive() {
+  if [[ -n $OPT_OUT ]]; then
+    local out=$OPT_OUT
+    [[ $out = /* ]] || out="$PWD/$out"
+    mkdir -p "$(dirname "$out")"
+    package_sdk "$OPT_SDK_DIR" "$out"
+  else
+    package_sdk "$OPT_SDK_DIR"
+  fi
+}
+
+do_restore() {
+  local archive=$OPT_OUT
+  [[ -n $archive ]] || die '--out=PATH is the archive to restore from'
+  [[ -f $archive ]] || die "archive not found: $archive"
+  local sdk=$OPT_SDK_DIR
+  mkdir -p "$sdk"
+  if [[ $archive = *.zst ]]; then
+    run tar --zstd -xf "$archive" -C "$sdk"
+  else
+    run tar -xf "$archive" -C "$sdk"
+  fi
+  log "Restored into $sdk"
+}
+
+do_shell() {
+  if [[ $OPT_MODE = docker ]]; then
+    docker_proxy_settings
+    local ubuntu_version
+    ubuntu_version=$(ubuntu_version_for_l4t "$L4T_VERSION")
+    ensure_base_image linux "$ubuntu_version"
+    local volume
+    volume=$(default_volume_name "$JETSON_VERSION_SLUG")
+    ensure_volume "$volume"
+    local base_image
+    base_image=$(default_base_image_tag linux "$ubuntu_version")
+    local project_dir=${JETSON_PROJECT_DIR:-$PWD}
+    docker run --rm -it --platform linux/arm64 \
+      "${proxy_run_args[@]}" \
+      -v "$volume:/opt/jetson-sdk" \
+      -v "$project_dir:/workspace" \
+      -w /workspace \
+      "$base_image" bash
+  else
+    [[ -f $OPT_SDK_DIR/activate.sh ]] \
+      || die "no SDK at $OPT_SDK_DIR; run 'jetson-cross build' first"
+    exec bash --rcfile <(printf 'source %q\n' "$OPT_SDK_DIR/activate.sh")
+  fi
+}
+
+do_run() {
+  shift $((OPTIND - 1))
+  local cmd=( "$@" )
+  if (( ${#cmd[@]} == 0 )); then
+    printf 'usage: jetson-cross run -- CMD [ARGS...]\n' >&2
+    exit 1
+  fi
+  if [[ $OPT_MODE = docker ]]; then
+    docker_proxy_settings
+    local ubuntu_version
+    ubuntu_version=$(ubuntu_version_for_l4t "$L4T_VERSION")
+    ensure_base_image linux "$ubuntu_version"
+    local volume
+    volume=$(default_volume_name "$JETSON_VERSION_SLUG")
+    ensure_volume "$volume"
+    local base_image
+    base_image=$(default_base_image_tag linux "$ubuntu_version")
+    docker run --rm --platform linux/arm64 \
+      "${proxy_run_args[@]}" \
+      -v "$volume:/opt/jetson-sdk" \
+      -v "$PWD:/workspace" \
+      -w /workspace \
+      "$base_image" "${cmd[@]}"
+  else
+    [[ -f $OPT_SDK_DIR/activate.sh ]] \
+      || die "no SDK at $OPT_SDK_DIR; run 'jetson-cross build' first"
+    # shellcheck disable=SC1090
+    ( source "$OPT_SDK_DIR/activate.sh"; "${cmd[@]}" )
+  fi
+}
+
+do_usage_guide() {
+  if (( OPT_SDK_DIR_USER )); then
+    [[ -d $OPT_SDK_DIR ]] || die "no SDK at $OPT_SDK_DIR"
+    render_usage_guide_sdk --out "$OPT_SDK_DIR/使用说明.md"
+    log "Wrote $OPT_SDK_DIR/使用说明.md"
+  elif [[ -n $OPT_OUT ]]; then
+    render_usage_guide_sdk --out "$OPT_OUT"
+  else
+    die 'usage-guide needs either --sdk-dir=DIR (writes DIR/使用说明.md) or --out=PATH'
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Entry
+# ----------------------------------------------------------------------------
+
+(( $# >= 1 )) || { usage >&2; exit 2; }
+ACTION=$1; shift
+
+case $ACTION in
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+  build|archive|restore|shell|run|usage-guide) ;;
+  *)
+    die_usage "unknown action: $ACTION"
+    ;;
+esac
+
+# Initialize OPT_* once so the run action's empty-arg path still has
+# defined variables for resolve_opts to read.
+parse_opts "$@"
+
+# `--` separates action flags from the command for `run`.
+if [[ $ACTION = run ]]; then
+  while (( $# > 0 )) && [[ $1 != -- ]]; do
+    case $1 in
+      --*=*)        set -- "${1%%=*}=${1#*=}" "${@:2}" ;;
+    esac
+    # Collect args until --
+    OPTIND=1
+    parse_opts "$@"
+    # If -- hasn't been seen, keep consuming; otherwise stop.
+    shift $((OPTIND - 1))
+    if [[ ${1:-} = -- ]]; then shift; break; fi
+  done
+  # shellcheck disable=SC2206
+  CMD=( "$@" )
+  set -- "${CMD[@]}"
+fi
+
+resolve_opts
+
+case $ACTION in
+  build)
+    case $OPT_PLATFORM in
+      linux-x86)
+        if [[ $OPT_MODE = docker ]]; then
+          build_via_docker
+        elif [[ $OPT_SOURCE = online ]]; then
+          build_linux_x86_online
+        else
+          build_offline_linux
+        fi
+        ;;
+      linux-arm64)
+        if [[ $OPT_MODE = docker ]]; then
+          build_via_docker
+        else
+          build_offline_linux
+        fi
+        ;;
+      macos-arm64)
+        # Always via Docker on macOS.
+        build_via_docker
+        ;;
+      jetson)
+        build_on_jetson
+        ;;
+    esac
+    ;;
+  archive)  do_archive ;;
+  restore)  do_restore ;;
+  shell)    do_shell ;;
+  run)      do_run "$@" ;;
+  usage-guide) do_usage_guide ;;
+esac
