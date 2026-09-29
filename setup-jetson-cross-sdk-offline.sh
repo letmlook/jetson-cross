@@ -6,8 +6,18 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 source "$script_dir/lib/jetson-versions.sh"
 
 # No Jetson device needed. Accepts either a JetPack or L4T version.
-# Usage: script [JETPACK_OR_L4T_VERSION] [SDK_DIR] [BSP_ARCHIVE ROOTFS_ARCHIVE]
-# Default: JetPack 6.1 (L4T 36.4.0).
+# Usage: script [--no-package] [JETPACK_OR_L4T_VERSION] [SDK_DIR] [BSP_ARCHIVE ROOTFS_ARCHIVE]
+# Default: JetPack 6.1 (L4T 36.4.0). A successful build is packaged into
+# <sdk-dir>.tar.gz next to the SDK unless --no-package is given.
+package_sdk_archive=1
+script_args=()
+for arg in "$@"; do
+  case $arg in
+    --no-package) package_sdk_archive=0 ;;
+    *) script_args+=("$arg") ;;
+  esac
+done
+set -- ${script_args[@]+"${script_args[@]}"}
 version_input=${1:-$DEFAULT_JETPACK_VERSION}
 resolve_jetson_version "$version_input" || {
   echo "Usage: $0 [6.1|36.4.0] [sdk-dir] [bsp.tbz2 sample-rootfs.tbz2]" >&2; exit 2;
@@ -36,6 +46,10 @@ if (( EUID == 0 )); then
   sudo() { command env "$@"; }
 else
   command -v sudo >/dev/null || die 'sudo is required when not running as root'
+  # Validate sudo credentials before any work starts, so the password prompt
+  # (or its failure in a non-interactive shell) surfaces immediately instead
+  # of minutes into the build.
+  sudo true
 fi
 
 if [[ -n $JETPACK_VERSION ]]; then
@@ -45,7 +59,7 @@ else
 fi
 
 log 'Installing host tools'
-sudo apt-get update
+sudo apt-get -o Acquire::Retries=3 update
 host_packages=(ca-certificates curl gnupg cmake ninja-build pkg-config file python3 bzip2)
 if $native_arm64; then
   # Native AArch64 host: chroot runs natively, so no qemu-aarch64-static
@@ -58,7 +72,7 @@ else
   # registration so aarch64 binaries execute transparently.
   host_packages+=(qemu-user-static binfmt-support binutils-aarch64-linux-gnu)
 fi
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${host_packages[@]}"
+sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y "${host_packages[@]}"
 if ! $native_arm64; then
   sudo update-binfmts --enable qemu-aarch64
   [[ -r /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] \
@@ -91,13 +105,43 @@ elif (( $# <= 2 )); then
       ;;
   esac
   log "Downloading official Jetson Linux $release BSP and sample rootfs"
-  [[ -s $bsp ]] || curl -fL --retry 3 -o "$bsp" \
+  [[ -s $bsp ]] || curl -fL --retry 3 --retry-all-errors -o "$bsp" \
     "$download_base/Jetson_Linux_r${release}_aarch64.tbz2"
-  [[ -s $sample ]] || curl -fL --retry 3 -o "$sample" \
+  [[ -s $sample ]] || curl -fL --retry 3 --retry-all-errors -o "$sample" \
     "$download_base/Tegra_Linux_Sample-Root-Filesystem_r${release}_aarch64.tbz2"
 else
   die "For L4T $release, pass matching official BSP and Sample Root Filesystem archives as arguments 3 and 4"
 fi
+
+# Build a minimal Debian package that satisfies NVIDIA l4t_update_initrd.sh's
+# `dpkg -s qemu-user-static` check without pulling in the actual qemu binary
+# (which is unused on a native AArch64 host where chroot executes natively).
+# Defined before its only call site, which runs while the sample rootfs is
+# being prepared -- before apply_binaries.sh, and before $root or the
+# rootfs_exec helper exist -- so it takes the rootfs path explicitly and
+# chroots directly (native AArch64 only, where chroot runs natively).
+install_qemu_user_static_stub() {
+  local target_root=$1
+  local stub_dir
+  stub_dir=$(mktemp -d)
+  mkdir -p "$stub_dir/DEBIAN"
+  cat > "$stub_dir/DEBIAN/control" <<EOF
+Package: qemu-user-static
+Version: 1:6.2+dfsg-2ubuntu6.31
+Architecture: all
+Maintainer: jetson-cross-sdk
+Description: stub package for native AArch64 hosts
+ Provides dpkg -s success for NVIDIA BSP l4t_update_initrd.sh CheckPackage.
+ On a native AArch64 host, chroot executes natively so the qemu-aarch64-static
+ binary is unnecessary; this stub satisfies the check without adding ~50MB.
+EOF
+  dpkg-deb -b "$stub_dir" "$stub_dir/qemu-user-static-stub.deb" >/dev/null
+  sudo install -d -m 0755 "$target_root/tmp"
+  sudo cp "$stub_dir/qemu-user-static-stub.deb" "$target_root/tmp/"
+  rm -rf "$stub_dir"
+  sudo chroot "$target_root" /bin/sh -c \
+    "dpkg -i /tmp/qemu-user-static-stub.deb && rm /tmp/qemu-user-static-stub.deb"
+}
 
 log 'Preparing NVIDIA sample filesystem'
 if [[ ! -f $sdk/.rootfs-initialized ]]; then
@@ -117,7 +161,7 @@ if [[ ! -f $sdk/.rootfs-initialized ]]; then
     # Install a stub qemu-user-static into the rootfs so the NVIDIA BSP's
     # l4t_update_initrd.sh CheckPackage passes. Native ARM64 hosts do not
     # need the real qemu-aarch64-static binary because chroot runs natively.
-    install_qemu_user_static_stub
+    install_qemu_user_static_stub "$l4t/rootfs"
   fi
   apply_args=()
   $native_arm64 && apply_args+=(--target-overlay)
@@ -137,12 +181,20 @@ if [[ -f $bsp_source ]]; then
   sudo mv -f "$bsp_source" "$bsp_source.disabled"
 fi
 keytmp=$(mktemp)
-curl -fsSL https://repo.download.nvidia.com/jetson/jetson-ota-public.asc -o "$keytmp"
+# repo.download.nvidia.com geo-redirects some regions to a regional mirror
+# whose DNS can fail transiently; retry across such errors.
+curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+  https://repo.download.nvidia.com/jetson/jetson-ota-public.asc -o "$keytmp"
 gpg --dearmor < "$keytmp" | sudo tee "$root/usr/share/keyrings/nvidia-jetson.gpg" >/dev/null
 rm -f "$keytmp"
 sudo tee "$root/etc/apt/sources.list.d/jetson-cross-sdk.list" >/dev/null <<EOF
 deb [signed-by=/usr/share/keyrings/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/common $repo main
 deb [signed-by=/usr/share/keyrings/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/t234 $repo main
+EOF
+# The same transient failures hit every long chroot apt run; let apt retry
+# downloads itself instead of aborting the whole build.
+sudo tee "$root/etc/apt/apt.conf.d/99jetson-cross-retries" >/dev/null <<'EOF'
+Acquire::Retries "3";
 EOF
 if ! $native_arm64; then
   sudo install -m 0755 /usr/bin/qemu-aarch64-static "$root/usr/bin/qemu-aarch64-static"
@@ -232,30 +284,6 @@ PY
     "$rewritten" "$escaping" "${report##*/}"
 }
 
-# Build a minimal Debian package that satisfies NVIDIA l4t_update_initrd.sh's
-# `dpkg -s qemu-user-static` check without pulling in the actual qemu binary
-# (which is unused on a native AArch64 host where chroot executes natively).
-# Run this before apply_binaries.sh so the initrd step sees the package.
-install_qemu_user_static_stub() {
-  local stub_dir
-  stub_dir=$(mktemp -d)
-  mkdir -p "$stub_dir/DEBIAN"
-  cat > "$stub_dir/DEBIAN/control" <<EOF
-Package: qemu-user-static
-Version: 1:6.2+dfsg-2ubuntu6.31
-Architecture: all
-Maintainer: jetson-cross-sdk
-Description: stub package for native AArch64 hosts
- Provides dpkg -s success for NVIDIA BSP l4t_update_initrd.sh CheckPackage.
- On a native AArch64 host, chroot executes natively so the qemu-aarch64-static
- binary is unnecessary; this stub satisfies the check without adding ~50MB.
-EOF
-  dpkg-deb -b "$stub_dir" "$stub_dir/qemu-user-static-stub.deb" >/dev/null
-  sudo install -d -m 0755 "$root/tmp"
-  sudo cp "$stub_dir/qemu-user-static-stub.deb" "$root/tmp/"
-  rm -rf "$stub_dir"
-  rootfs_exec /bin/sh -c "dpkg -i /tmp/qemu-user-static-stub.deb && rm /tmp/qemu-user-static-stub.deb"
-}
 rootfs_exec /bin/sh -c 'apt-get update'
 cuda_suffix=$(rootfs_exec /bin/sh -c \
   "apt-cache depends cuda-toolkit | sed -n 's/.*Depends: cuda-toolkit-\([0-9][0-9]*-[0-9][0-9]*\)$/\1/p' | head -n 1")
@@ -386,7 +414,8 @@ elif [[ -x /usr/local/cuda-$cuda_version/bin/nvcc ]]; then
 fi
 if [[ -z $nvcc ]] && ! $native_arm64; then
   sudo install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://repo.download.nvidia.com/jetson/jetson-ota-public.asc \
+  curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+    https://repo.download.nvidia.com/jetson/jetson-ota-public.asc \
     | gpg --dearmor | sudo tee /etc/apt/keyrings/nvidia-jetson.gpg >/dev/null
   codename=$(. /etc/os-release; printf '%s' "$VERSION_CODENAME")
   printf 'deb [signed-by=/etc/apt/keyrings/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/x86_64/%s %s main\n' "$codename" "$repo" \
@@ -411,7 +440,7 @@ else
   log 'Installing reference Bootlin cross compiler'
   archive="$sdk/downloads/$toolname.tar.bz2"
   if [[ ! -x $sdk/toolchain/$toolname/bin/aarch64-buildroot-linux-gnu-g++ ]]; then
-    [[ -s $archive ]] || curl -fL --retry 3 -o "$archive" \
+    [[ -s $archive ]] || curl -fL --retry 3 --retry-all-errors -o "$archive" \
       "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/$toolname.tar.bz2"
     tar -xjf "$archive" -C "$sdk/toolchain"
   fi
@@ -424,7 +453,10 @@ fi
 # an x86_64 host nvcc lives outside the SDK and stays absolute.
 if $native_arm64; then activate_cross_rel=; else activate_cross_rel="toolchain/$toolname/bin/aarch64-buildroot-linux-gnu-"; fi
 case $nvcc in
-  "$root"/*) activate_nvcc_rel=${nvcc#"$root"/} ;;
+  # The relative form must resolve against $JETSON_SDK in activate.sh, so an
+  # nvcc inside the SDK (the rootfs sysroot on a native ARM64 host) is stored
+  # relative to the SDK root, not to the rootfs.
+  "$sdk"/*) activate_nvcc_rel=${nvcc#"$sdk"/} ;;
   *) activate_nvcc_rel=$nvcc ;;
 esac
 cat > "$sdk/activate.sh" <<'EOF'
@@ -453,9 +485,18 @@ case "$__jetson_nvcc_rel" in
   /*) CUDACXX=$__jetson_nvcc_rel ;;
   *)  CUDACXX="$JETSON_SDK/$__jetson_nvcc_rel" ;;
 esac
+__jetson_cuda_wrapper_rel='@CUDA_WRAPPER_REL@'
 # The host nvcc lives outside the SDK, so allow overriding it at source time.
 [ -n "${JETSON_NVCC:-}" ] && CUDACXX=$JETSON_NVCC
-unset __jetson_nvcc_rel
+# CMake's compiler-detection step (CMakeDetermineCompilerId) calls nvcc
+# directly with no toolchain flags, so it cannot reach sysroot CUDA headers
+# when the host nvcc lives outside the SDK. Route CUDACXX through a wrapper
+# that injects the sysroot include path for every nvcc invocation.
+if [[ -n $__jetson_cuda_wrapper_rel && -x $JETSON_SDK/$__jetson_cuda_wrapper_rel ]]; then
+  __jetson_cuda_wrapper="$JETSON_SDK/$__jetson_cuda_wrapper_rel"
+  CUDACXX="$__jetson_cuda_wrapper"
+fi
+unset __jetson_nvcc_rel __jetson_cuda_wrapper_rel __jetson_cuda_wrapper
 export JETSON_SDK JETSON_ROOTFS JETSON_CROSS
 export CROSS_COMPILE="$JETSON_CROSS"
 export CUDACXX
@@ -466,6 +507,85 @@ unset PKG_CONFIG_PATH
 EOF
 sed -i "s|@CROSS_REL@|$activate_cross_rel|; s|@NVCC_REL@|$activate_nvcc_rel|" "$sdk/activate.sh"
 chmod 0755 "$sdk/activate.sh"
+
+# Always generate a CUDA include directory inside the SDK and route nvcc
+# through a wrapper that adds it to every invocation. The directory only
+# hosts symlinks to the sysroot CUDA tree, so it stays a few KB; the wrapper
+# is generated as a relative path so the SDK remains relocatable.
+cuda_host_include="$sdk/cuda-host-include"
+sudo mkdir -p "$cuda_host_include"
+sudo chown "$(id -un)" "$cuda_host_include"
+if [[ -d $root/usr/local/cuda/targets/aarch64-linux/include ]]; then
+  for f in "$root/usr/local/cuda/targets/aarch64-linux/include"/*; do
+    name=$(basename "$f")
+    ln -sfn "../../Linux_for_Tegra/rootfs/usr/local/cuda/targets/aarch64-linux/include/$name" \
+      "$cuda_host_include/$name"
+  done
+fi
+nvcc_wrapper_rel=bin/nvcc
+sudo install -d -m 0755 "$sdk/bin"
+# Remove any leftover symlink so the wrapper below is written as a real file.
+# Without this, sudo tee follows an existing symlink and the script-generated
+# wrapper never lands in the SDK.
+sudo rm -f "$sdk/bin/nvcc"
+sudo tee "$sdk/bin/nvcc" >/dev/null <<'WRAPPER'
+#!/usr/bin/env bash
+# Generated by setup-jetson-cross-sdk-offline.sh.
+# Adds the SDK-local CUDA include directory to every nvcc invocation so
+# sysroot headers stay reachable even when CMake calls nvcc directly
+# (CMakeDetermineCompilerId, for example) without toolchain flags.
+set -e
+self=$(readlink -f "$0")
+sdk=$(dirname "$(dirname "$self")")
+# Resolve the include directory to an absolute path up front: nvcc keeps the
+# -I argument verbatim and only resolves relative paths against the build
+# directory, which CMake changes between configure and build.
+include_dir=$(readlink -f "$sdk/cuda-host-include")
+# Find the real nvcc. Honor JETSON_NVCC the same way activate.sh does, but
+# otherwise prefer the host's nvcc: it links against the host's libpthread
+# and libc, which is what is available when CMake's CUDA compiler-detection
+# step runs the resulting aarch64 binary via qemu. The sysroot's nvcc is an
+# ARM64 ELF that cannot load its own sysroot's libraries on an x86_64 host.
+real_nvcc=${JETSON_NVCC:-}
+if [[ -z $real_nvcc ]]; then
+  candidates=(/usr/local/cuda/bin/nvcc
+              /usr/local/cuda-12.6/bin/nvcc
+              /usr/bin/nvcc
+              "$sdk/Linux_for_Tegra/rootfs/usr/local/cuda-12.6/bin/nvcc"
+              "$sdk/Linux_for_Tegra/rootfs/usr/local/cuda/bin/nvcc")
+  for c in "${candidates[@]}"; do
+    [[ -x $c ]] && real_nvcc=$c && break
+  done
+fi
+[[ -x $real_nvcc ]] || { echo "jetson-nvcc-wrapper: no nvcc found" >&2; exit 1; }
+# nvcc links aarch64 binaries with -lcudart_static -lcudadevrt and looks for
+# them under the host CUDA's targets/aarch64-linux/lib. That directory only
+# carries stubs on a host without the matching cross-aarch64 CUDA package,
+# so prepend the sysroot CUDA target lib dir (real libraries) to every -L.
+sysroot_cuda_lib=$JETSON_SDK/Linux_for_Tegra/rootfs/usr/local/cuda-12.6/targets/aarch64-linux/lib
+[[ -d $sysroot_cuda_lib ]] || sysroot_cuda_lib=$JETSON_SDK/Linux_for_Tegra/rootfs/usr/local/cuda/targets/aarch64-linux/lib
+rebuilt=()
+for arg in "$@"; do
+  case $arg in
+    -I"$include_dir"|-I"$sdk/cuda-host-include")
+      need_inject=0
+      rebuilt+=("$arg")
+      ;;
+    -L*/targets/aarch64-linux/lib*)
+      rebuilt+=("-L$sysroot_cuda_lib")
+      ;;
+    *)
+      rebuilt+=("$arg")
+      ;;
+  esac
+done
+exec "$real_nvcc" -I"$include_dir" "${rebuilt[@]}"
+  exec "$real_nvcc" "$@"
+fi
+WRAPPER
+sudo chmod 0755 "$sdk/bin/nvcc"
+sudo chown "$(id -un)" "$sdk/bin/nvcc"
+sed -i "s|@CUDA_WRAPPER_REL@|$nvcc_wrapper_rel|" "$sdk/activate.sh"
 # cuDNN must be present, not merely requested. An earlier package list omitted
 # it and nothing noticed, which left an SDK that could not build any cuDNN code
 # while still reporting success. The Jetson repo installs the headers under a
@@ -536,6 +656,11 @@ set(CMAKE_CUDA_TARGET_LIB_DIR "\${CMAKE_SYSROOT}/usr/local/cuda/targets/aarch64-
 # find_library never reads the linker flags, so the CUDA target directory must
 # also be registered as a search path for find_library(cudart) to succeed.
 list(APPEND CMAKE_LIBRARY_PATH "\${CMAKE_CUDA_TARGET_LIB_DIR}")
+# nvcc always links the runtime with -lcudart_static -lcudadevrt on the host
+# command line. The host linker only knows about its own aarch64 stub libs
+# (no static copies), so it cannot find these symbols without an explicit -L
+# to the sysroot CUDA target library directory.
+set(CMAKE_CUDA_FLAGS_INIT "\${CMAKE_CUDA_FLAGS_INIT} -L\${CMAKE_CUDA_TARGET_LIB_DIR}")
 set(CMAKE_CUDNN_INCLUDE_DIR "\${CMAKE_SYSROOT}/$cudnn_include_dir")
 set(CMAKE_CUDNN_LIB_DIR "\${CMAKE_SYSROOT}/$cudnn_lib_dir")
 # Every CUDA public header, cuda_runtime_api.h included, includes
@@ -616,9 +741,13 @@ else
 fi
 
 # cuDNN must compile and link from the sysroot, not merely exist on disk.
+# cudnn.h includes cuda_runtime_api.h, which lives in the sysroot CUDA target
+# include tree rather than /usr/include, so that path must be explicit here
+# just as it is for the CUDA smoke test above.
 printf '#include <cudnn.h>\nint main(){return (int)cudnnGetVersion();}\n' \
   | "${cross}g++" "${smoke_cxx_flags[@]}" "${smoke_ldflags[@]}" \
     ${cudnn_include_args[@]+"${cudnn_include_args[@]}"} \
+    -isystem "$cuda_target_inc" \
     -L"$root/$cudnn_lib_dir" -Wl,-rpath-link,"$root/$cudnn_lib_dir" -lcudnn \
     -x c++ - -o "$sdk/smoke-cudnn-aarch64" \
   || die 'Could not compile a cuDNN translation unit against the sysroot'
@@ -660,16 +789,71 @@ slim_sdk() {
 log 'Removing install-only caches and documentation'
 slim_sdk "$sdk" "$root"
 
-# Ship the usage guide inside the SDK. A copied or archived SDK carries its own
-# documentation, so it stays usable away from the repository it was built from.
+# Ship the usage guide and the example project inside the SDK. A copied or
+# archived SDK carries its own documentation and a ready-made build target,
+# so it stays usable away from the repository it was built from.
 sdk_guide="$script_dir/docs/使用说明.md"
 if [[ -f $sdk_guide ]]; then
   install -m 0644 "$sdk_guide" "$sdk/使用说明.md"
 else
   log "WARNING: $sdk_guide not found; the SDK will ship without a usage guide"
 fi
+sdk_example="$script_dir/example-cuda-smoke"
+if [[ -d $sdk_example ]]; then
+  # Drop any leftover example dir from a previous build so the copy below
+  # does not nest copies (example-cuda-smoke/example-cuda-smoke/...) when
+  # this script is rerun against the same SDK directory.
+  rm -rf "$sdk/example-cuda-smoke"
+  cp -r "$sdk_example" "$sdk/example-cuda-smoke"
+else
+  log "WARNING: $sdk_example not found; the SDK will ship without the example project"
+fi
+
+# Package the completed SDK into a single archive so it can be moved to
+# another machine or kept as a versioned artifact. zstd is the default, as in
+# the macOS archive flow; gzip is the fallback where zstd is unavailable. The
+# archive is written under a temporary name and replaces a previous one only
+# after a full listing verifies the required files, so an interrupted run
+# never destroys the last good archive.
+package_sdk() {
+  local sdk_dir=$1
+  local archive="$sdk_dir.tar.zst"
+  local list_flags=(--zstd)
+  local compressor='zstd -T0 -q'
+  if ! command -v zstd >/dev/null; then
+    archive="$sdk_dir.tar.gz"
+    list_flags=(-z)
+    if command -v pigz >/dev/null; then compressor=pigz; else compressor=gzip; fi
+  fi
+  local archive_tmp="$archive.new"
+  log "Packaging SDK into ${archive##*/} (via $compressor)"
+  sudo tar -I "$compressor" -cf "$archive_tmp" \
+    -C "$(dirname "$sdk_dir")" "$(basename "$sdk_dir")"
+  # Listing the archive back decompresses the whole stream, so this doubles
+  # as an integrity check of everything tar wrote.
+  local found
+  found=$(tar "${list_flags[@]}" -tf "$archive_tmp" 2>/dev/null \
+    | grep -cE "^$(basename "$sdk_dir")/(activate.sh|toolchain.cmake|\.setup-complete)$" || true)
+  [[ $found = 3 ]] || die "Packaged archive is incomplete (found $found of 3 required files)"
+  sudo chown "$(id -un)" "$archive_tmp"
+  mv -f "$archive_tmp" "$archive"
+  printf '    archive: %s\n' "$archive"
+  if [[ $archive = *.zst ]]; then
+    printf '    extract with: tar --zstd -xf %s\n' "$(basename "$archive")"
+  else
+    printf '    extract with: tar -xf %s\n' "$(basename "$archive")"
+  fi
+}
 
 touch "$sdk/.setup-complete"
+if (( package_sdk_archive )); then
+  package_sdk "$sdk"
+else
+  log 'Skipping SDK packaging (--no-package)'
+fi
 log "SDK ready: source '$sdk/activate.sh'"
-echo "cmake -S PROJECT -B BUILD -DCMAKE_TOOLCHAIN_FILE='$sdk/toolchain.cmake'"
+if [[ -d $sdk/example-cuda-smoke ]]; then
+  printf '  cmake -S %s/example-cuda-smoke -B %s/example-cuda-smoke/build -G Ninja \\\n' "$sdk" "$sdk"
+  printf '        -DCMAKE_TOOLCHAIN_FILE=%s/toolchain.cmake\n' "$sdk"
+fi
 echo "Full usage guide: $sdk/使用说明.md"

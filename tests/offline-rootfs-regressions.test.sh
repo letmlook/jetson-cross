@@ -23,6 +23,14 @@ apply_line=$(grep -n 'sudo ./apply_binaries.sh' "$script" | cut -d: -f1)
 grep -Fq 'Removing incomplete NVIDIA rootfs setup before retrying' "$script"
 grep -Fq 'sudo rm -rf "$l4t"' "$script"
 
+# The native-ARM64 stub installer runs while the sample rootfs is still being
+# prepared, so it must be defined before its call site and must not depend on
+# $root or rootfs_exec, neither of which exists yet at that point.
+stub_def_line=$(grep -n 'install_qemu_user_static_stub()' "$script" | cut -d: -f1)
+stub_call_line=$(grep -n 'install_qemu_user_static_stub "$l4t/rootfs"' "$script" | cut -d: -f1)
+[[ -n $stub_def_line && -n $stub_call_line && $stub_def_line -lt $stub_call_line ]]
+grep -Fq 'local target_root=$1' "$script"
+
 # apply_binaries.sh installs an unsigned-by NVIDIA source for the same URLs.
 # Keeping it active alongside jetson-cross-sdk.list makes apt reject both.
 grep -Fq '"$bsp_source.disabled"' "$script"
@@ -68,6 +76,13 @@ grep -Fq 'JETSON_NVCC' "$script"
 # The generated activation helper must be directly executable as well as
 # sourceable by an interactive shell.
 grep -Fq 'chmod 0755 "$sdk/activate.sh"' "$script"
+
+# CMakeDetermineCompilerId calls nvcc without toolchain flags, so the
+# activation file must route CUDACXX through an SDK-local wrapper that
+# forwards to the real nvcc with the sysroot CUDA include path injected.
+grep -Fq 'CUDA_WRAPPER_REL' "$script"
+grep -Fq 'cuda-host-include' "$script"
+grep -Fq 'install -d -m 0755 "$sdk/bin"' "$script"
 
 # Installation may run in a container whose Ninja binary is not persisted to
 # the host, so the printed host-side example must not force that generator.

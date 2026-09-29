@@ -21,10 +21,12 @@ fixtures="$tmp/fixtures"
 sdk="$tmp/sdk"
 mkdir -p "$fakebin" "$fixtures/bsp/Linux_for_Tegra/rootfs" \
   "$fixtures/rootfs/etc/apt/sources.list.d" \
+  "$fixtures/rootfs/etc/apt/apt.conf.d" \
   "$fixtures/rootfs/usr/share/keyrings" \
   "$fixtures/rootfs/usr/sbin" \
   "$fixtures/rootfs/usr/bin" \
   "$fixtures/rootfs/usr/include/aarch64-linux-gnu" \
+  "$fixtures/rootfs/usr/lib/aarch64-linux-gnu" \
   "$fixtures/rootfs/usr/local/cuda-12.6/bin"
 
 cat > "$fixtures/bsp/Linux_for_Tegra/apply_binaries.sh" <<'EOF'
@@ -38,6 +40,10 @@ cat > "$fixtures/rootfs/usr/local/cuda-12.6/bin/nvcc" <<'EOF'
 printf '%s\n' 'Cuda compilation tools, release 12.6, V12.6.0'
 EOF
 chmod +x "$fixtures/rootfs/usr/local/cuda-12.6/bin/nvcc"
+# The script refuses to declare success without a usable cuDNN, so the
+# fixture rootfs must carry the header and library the checks look for.
+: > "$fixtures/rootfs/usr/include/cudnn.h"
+: > "$fixtures/rootfs/usr/lib/aarch64-linux-gnu/libcudnn.so"
 tar -cjf "$tmp/bsp.tbz2" -C "$fixtures/bsp" Linux_for_Tegra
 tar -cjf "$tmp/rootfs.tbz2" -C "$fixtures/rootfs" .
 
@@ -94,7 +100,13 @@ chmod +x "$out"
 EOF
 cat > "$fakebin/readelf" <<'EOF'
 #!/bin/sh
-printf '%s\n' '  Machine: AArch64'
+if test "${1:-}" = -d; then
+  printf '%s\n' 'Shared library: [libm.so.6]'
+  printf '%s\n' 'Shared library: [libcudart]'
+  printf '%s\n' 'Shared library: [libcudnn]'
+else
+  printf '%s\n' '  Machine: AArch64'
+fi
 EOF
 cat > "$fakebin/file" <<'EOF'
 #!/bin/sh
@@ -113,8 +125,21 @@ PATH="$fakebin:$PATH" JETSON_OS_RELEASE_FILE="$tmp/os-release" \
 
 test -f "$sdk/.setup-complete"
 test -x "$sdk/activate.sh"
-grep -Fq "export JETSON_CROSS=''" "$sdk/activate.sh"
-grep -Fq "export CUDACXX='$sdk/Linux_for_Tegra/rootfs/usr/local/cuda-12.6/bin/nvcc'" "$sdk/activate.sh"
+test -x "$sdk/bin/nvcc"
+test -d "$sdk/cuda-host-include"
+# The activation file resolves every path from its own location instead of
+# baking in build-time absolutes, so source it and assert the values a native
+# ARM64 host must see rather than grep for template text.
+(
+  # shellcheck disable=SC1091
+  . "$sdk/activate.sh"
+  [[ -z $JETSON_CROSS ]]
+  # CUDACXX points at the SDK-local wrapper so CMake's compiler-detection
+  # step can reach sysroot CUDA headers; the wrapper forwards to the real
+  # nvcc that lives next to it.
+  [[ $CUDACXX = "$sdk/bin/nvcc" ]]
+  [[ $JETSON_ROOTFS = "$sdk/Linux_for_Tegra/rootfs" ]]
+)
 grep -Fq 'chroot ' "$COMMAND_LOG"
 ! grep -Fq 'qemu-aarch64' "$COMMAND_LOG"
 ! test -d "$sdk/toolchain/aarch64--glibc--stable-2022.08-1"

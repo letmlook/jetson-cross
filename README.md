@@ -66,6 +66,16 @@ The offline script defaults to JetPack 6.1 and accepts either version family:
 ./setup-jetson-cross-sdk-offline.sh 36.4.4
 ```
 
+A successful build is packaged automatically into `<sdk-dir>.tar.zst` next to
+the SDK directory (zstd, matching the macOS archive flow; gzip is the
+fallback where zstd is unavailable), and only replaces a previous archive
+after its contents verify. Pass `--no-package` (in any position) to skip
+packaging:
+
+```bash
+./setup-jetson-cross-sdk-offline.sh 6.1 --no-package
+```
+
 On an AArch64 Ubuntu host it uses native GCC, binutils, and CUDA compiler
 packages. On x86_64 Ubuntu it retains the Bootlin cross compiler and QEMU
 rootfs setup.
